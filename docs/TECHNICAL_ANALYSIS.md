@@ -1,6 +1,6 @@
 # Technical Analysis Report: Jio Airfiber 5G WAN For OpenWrt
 
-> **Scope Note:** `https://github.com/marufagul/jio-airfiber-openwrt-5g-wan` was not directly indexable/readable during report generation, so this analysis compares our empirically verified **Jio Airfiber 5G WAN For OpenWrt** (OpenWrt 25.12.6 & Snapshot) architecture against the standard Jio AirFiber OpenWrt 5G WAN reference design (VLAN 1015 + `464xlat` + `odhcpd` relay + WAN-LED monitoring). Every metric and kernel behavior below was verified directly on live MediaTek `mt7986` hardware connected to Jio 5G.
+> **Scope Note:** `https://github.com/marufagul/jio-airfiber-openwrt-5g-wan` was not directly indexable during report generation, so this analysis compares our empirically verified **Jio Airfiber 5G WAN For OpenWrt** (OpenWrt 25.12.6 & Snapshot) architecture against the standard Jio AirFiber OpenWrt 5G WAN reference design (VLAN 1015 + `464xlat` + `odhcpd` relay + WAN-LED monitoring). Every metric and kernel behavior below was verified directly on live MediaTek `mt7986` hardware connected to Jio 5G.
 
 ---
 
@@ -12,9 +12,9 @@
 | **464XLAT MTU Strategy** | Default `464-clat` MTU (`1280`) or raised single MTU (`1460` / `1380`). | **Split MTU:** `1280` device MTU + `1260` IPv4 route MTU + `1220` `advmss` + `fw4` forward-chain `1220` TCP MSS clamp. | Eliminates silent NAT64 drops and `nat46` return-path kernel drops. Cut 10 MB IPv4 download time from **19s → 3s** with **0 dropped packets**. |
 | **LAN IPv6 (`odhcpd` Relay)** | Often enables `ra='relay'`, `dhcpv6='relay'`, `ndp='relay'` to share Jio's SLAAC `/64`. | Disables `odhcpd` `ndp='relay'` on `wan6`/`lan`. | Prevents `odhcpd` and `464xlat` from fighting over `wan` `allmulticast` mode (which caused kernel flapping every ~100 ms and throughput collapse). |
 | **Flow Offloading** | Often enabled (Software or MediaTek Hardware PPE) for Gigabit routing. | Explicitly disabled (`flow_offloading='0'`, `flow_offloading_hw='0'`); `packet_steering='1'` enabled. | MediaTek PPE and software flow offloading bypass `mtu_fix`/MSS rules and stall `kmod-nat46` (`464-clat`) flows; `packet_steering` safely distributes load across `mt7986` cores. |
-| **Official 25.12.6 `odhcp6c`** | Assumes stock `odhcp6c` works identically across releases. | Documents and preserves the working `odhcp6c` + `dhcpv6` scripts in `/etc/sysupgrade.conf`. | Official 25.12.6 exhibits an `odhcp6c` regression on Jio SLAAC links; preserving the matched binary/scripts keeps Official 25.12.6 rock-solid. |
+| **Official 25.12.6 `odhcp6c`** | Assumes stock `odhcp6c` works identically across releases. | Bundles working `mt7986` (`aarch64`) `files/odhcp6c`, `files/dhcpv6.sh`, and `files/dhcpv6.script`, auto-installs with backup, and preserves in `/etc/sysupgrade.conf`. | Official 25.12.6 exhibits an `odhcp6c` regression on Jio SLAAC links; the bundled `mt7986` files restore instant RA/SLAAC bring-up across all `mt7986` routers. |
 | **DNS Privacy & Leaks** | Relies on WAN peer DNS or partial overrides. | Forces `peerdns='0'` on `wan`/`wan6`/`clat` + `dnsmasq` `noresolv='1'` (Cloudflare + Google IPv4/IPv6). | Guarantees Jio's upstream DNS (`2405:200:800::11`) is never queried even after interface flaps. |
-| **WAN LED Telemetry** | Dedicated WAN-LED script tied to interface status. | Auto-detecting `procd` daemon (`5g-wan-led.sh`) testing both live IPv6 & 464XLAT IPv4 reachability, excluding Wi-Fi settings. | Distinguishes healthy dual-stack (solid) vs. IPv6-only/CLAT-down (slow blink) vs. WAN offline (red/fast blink). |
+| **WAN LED Telemetry** | Dedicated WAN-LED script tied to interface status. | Auto-detecting `procd` daemon (`jio-wan-led.sh`) testing both live IPv6 & 464XLAT IPv4 reachability, excluding Wi-Fi settings. | Distinguishes healthy dual-stack (solid) vs. IPv6-only/CLAT-down (slow blink) vs. WAN offline (red/fast blink). |
 
 ---
 
@@ -52,5 +52,6 @@ Jio AirFiber 5G provides an IPv6-only transport; leaving `network.wan` enabled c
 
 ## 3. Credits
 
-- **[marufagul](https://github.com/marufagul)** (`github.com/marufagul/jio-airfiber-openwrt-5g-wan`) — Original inspiration for OpenWrt Jio AirFiber 5G WAN automation and WAN-LED status monitoring.
+- **The DIY Daddy** ([github.com/the-diy-daddy](https://github.com/the-diy-daddy)) — Author, live hardware testing, and repository maintenance.
+- **marufagul** ([github.com/marufagul/jio-airfiber-openwrt-5g-wan](https://github.com/marufagul/jio-airfiber-openwrt-5g-wan)) — Original inspiration for OpenWrt Jio AirFiber 5G WAN automation and WAN-LED status monitoring.
 - **Google Gemini** — Empirical packet-level debugging, split-MTU/MSS architecture, `allmulticast` conflict isolation, universal script engineering, and technical documentation.
