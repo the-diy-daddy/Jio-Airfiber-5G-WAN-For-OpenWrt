@@ -171,7 +171,7 @@ Run this single command over SSH to download the entire repository (all scripts 
 
 ```sh
 rm -rf /tmp/Jio-Airfiber-5G-WAN-For-OpenWrt-main /tmp/5g-wan-jio-airfiber-for-openwrt /tmp/jio5g.tar.gz && \
-wget -O /tmp/jio5g.tar.gz https://github.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/archive/refs/heads/main.tar.gz && \
+wget -4 -O /tmp/jio5g.tar.gz https://codeload.github.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/tar.gz/refs/heads/main && \
 tar -xzf /tmp/jio5g.tar.gz -C /tmp && \
 mv /tmp/Jio-Airfiber-5G-WAN-For-OpenWrt-main /tmp/5g-wan-jio-airfiber-for-openwrt && \
 chmod +x /tmp/5g-wan-jio-airfiber-for-openwrt/scripts/*.sh
