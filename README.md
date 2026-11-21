@@ -1,6 +1,6 @@
 <div align="center">
 
-# Jio AirFiber 5G WAN for OpenWrt
+# Jio AirFiber 5G WAN for OpenWrt - 6J01
 
 **Production-tested SLAAC IPv6 + 464XLAT (`kmod-nat46`) automation toolkit for Jio AirFiber 5G ODUs on OpenWrt**
 
