@@ -4,6 +4,11 @@
 
 **Production-Tested SLAAC IPv6 + 464XLAT (`kmod-nat46`) Automation for MediaTek Filogic (`mt7986`) Routers**
 
+[![OpenWrt](https://img.shields.io/badge/OpenWrt-25.12.x%20%7C%20Snapshot-00B5E2?style=for-the-badge&logo=openwrt&logoColor=white)](https://openwrt.org/)
+[![Platform](https://img.shields.io/badge/Platform-MediaTek%20Filogic%20mt7986-2E7D32?style=for-the-badge)](https://openwrt.org/docs/techref/hardware/soc/soc.mediatek.filogic)
+[![IPv4 over IPv6](https://img.shields.io/badge/Transport-464XLAT%20Split--MTU-FF6F00?style=for-the-badge)](docs/TECHNICAL_ANALYSIS.md)
+[![License](https://img.shields.io/badge/License-Personal%20Non--Commercial-D32F2F?style=for-the-badge)](LICENSE)
+
 *Built and hardware-verified on live Jio AirFiber 5G ODU connections across **OpenWrt Snapshot** and **Official OpenWrt 25.12.6**.*
 
 [Firmware Build](#step-1-build-firmware-on-openwrt-firmware-selector) •
@@ -20,13 +25,12 @@
 
 ## Why This Toolkit Exists
 
-Jio AirFiber 5G Outdoor Units (ODU) deliver an **IPv6-only SLAAC transport without Prefix Delegation (`IA_PD`)** and translate IPv4 through Jio's carrier NAT64 gateway (`64:ff9b::/96`). Stock OpenWrt configurations suffer from five common failure modes on this link:
+Jio AirFiber 5G Outdoor Units (ODU) deliver an **IPv6-only SLAAC transport without Prefix Delegation (`IA_PD`)** and translate IPv4 through Jio's carrier NAT64 gateway (`64:ff9b::/96`). Stock OpenWrt configurations suffer from four silent failure modes on this link:
 
 1. **TCP Stalls & Packet Drops:** Default `464-clat` MTU settings trigger silent drops on Jio's 1280-byte NAT64 TCP path (`19s` for 10 MB vs. `3s` with Split-MTU).
 2. **`allmulticast` Interface Flapping:** Enabling `odhcpd` NDP relay conflicts with `464xlat` Proxy NDP, toggling `wan` multicast mode every ~100 ms.
 3. **Flow Offloading Breakage:** Both MediaTek Hardware PPE and Software Flow Offloading break `kmod-nat46` translation or bypass TCP MSS clamping.
-4. **CLAT Discovery & Duplicate Interfaces:** When ISP DNS is disabled in favor of Cloudflare/Google DNS, `464xlat` cannot auto-discover `ipv4only.arpa` without an explicit `ip6prefix='64:ff9b::/96'`, while `dhcpv6.script` spawns a duplicate `464-wan6_4` unless `iface_464xlat='0'` is set.
-5. **Official OpenWrt 25.12.6 `odhcp6c` Regression:** Stock `odhcp6c` on Official 25.12.6 fails to reliably bring up SLAAC on Jio 5G without the verified `mt7986` (`aarch64`) `files/odhcp6c/` bundle.
+4. **Official OpenWrt 25.12.6 `odhcp6c` Regression:** Stock `odhcp6c` on Official 25.12.6 fails to reliably bring up SLAAC on Jio 5G without the verified `mt7986` (`aarch64`) `files/odhcp6c/` bundle.
 
 ---
 
