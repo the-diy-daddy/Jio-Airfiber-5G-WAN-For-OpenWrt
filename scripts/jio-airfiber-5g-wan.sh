@@ -1,69 +1,92 @@
 #!/bin/sh
 # ==============================================================================
-# Jio Airfiber 5G WAN For OpenWrt (OpenWrt Official 25.12.x & Snapshot)
-# - Designed to be staged once into /tmp/5g-wan-jio-airfiber-for-openwrt
-#   (e.g., over temporary external Wi-Fi client wwan) and executed offline
-# - Automatically detects Official firmware on aarch64 (mt7986), backs up stock
-#   files to /root/odhcp6c-25.12.6-backup/, applies odhcp6c, dhcpv6.sh, and
-#   dhcpv6.script with 0755 permissions, and restarts netifd cleanly
-# - Configures IPv6 SLAAC + 464XLAT (kmod-nat46) on untagged wan or VLAN 1015
-#   with explicit NAT64 prefix (64:ff9b::/96) and iface_464xlat='0'
-# - Enforces 1280/1260/1220 split-MTU & fw4 MSS clamping for Jio NAT64 stability
-# - Disables odhcpd relay conflict (allmulticast flapping fix) & flow_offloading
-# - Sets Cloudflare + Google DNS with ISP DNS leak prevention
-# - Installs optional procd WAN LED monitor (does NOT touch Wi-Fi settings)
-# - Preserves hooks, LED daemon, and patched binaries in /etc/sysupgrade.conf
+# Jio Airfiber 5G WAN For OpenWrt (Official 25.12.x & Snapshot)
+# Author: The DIY Daddy (https://github.com/the-diy-daddy)
+#
+# Usage:
+#   /tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --mac "00:1A:79:b6:56:6c"
+#
+# Key guarantees:
+# - Ignores SIGHUP (trap '' HUP) and commits + syncs 100% of files & UCI configs
+#   BEFORE restarting netifd in a detached background job (so SSH never kills
+#   the script mid-update).
+# - Atomic ELF/script installation (cp -> chmod 0755 -> mv -f) avoids ETXTBSY
+#   ("Text file busy") when odhcp6c is already running.
+# - Sets wan6.iface_464xlat='0' and clat.ip6prefix='64:ff9b::/96' so a single
+#   464-clat interface comes up cleanly alongside private Cloudflare/Google DNS.
+# - Enforces 1280/1260/1220 split-MTU & fw4 MSS clamping, disables odhcpd NDP
+#   relay conflict and flow_offloading, enables packet_steering, and preserves
+#   everything in /etc/sysupgrade.conf.
 # ==============================================================================
 
 set -eu
+trap '' HUP
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 BACKUP_DIR="/root/odhcp6c-25.12.6-backup"
+LOG_FILE="/tmp/jio-5g-setup.log"
+RESTART_LOG="/tmp/jio-network-restart.log"
 
 # --- Configurable Defaults (override via CLI flags, env vars, or prompts) ---
 WAN_MODE="${WAN_MODE:-}"                   # "untagged" or "vlan1015"
 WAN_MAC="${WAN_MAC:-}"                     # e.g., "00:1A:79:b6:56:6c"
+NAT64_PREFIX="${NAT64_PREFIX:-64:ff9b::/96}"
 ENABLE_WAN_LED="${ENABLE_WAN_LED:-}"       # "1" or "0"
 APPLY_ODHCP6C_FIX="${APPLY_ODHCP6C_FIX:-}" # "auto" (default), "1", or "0"
+NO_RESTART="${NO_RESTART:-0}"
 NON_INTERACTIVE=0
-CLAT_NAT64_PREFIX="64:ff9b::/96"
 CLAT_DEV_MTU="1280"
 CLAT_ROUTE_MTU="1260"
 CLAT_TCP_MSS="1220"
 
-log()  { printf '[JIO-5G] %s\n' "$1"; }
-warn() { printf '[WARN]   %s\n' "$1"; }
-err()  { printf '[ERROR]  %s\n' "$1" >&2; exit 1; }
+: > "$LOG_FILE" 2>/dev/null || true
+
+log()  { printf '[JIO-5G] %s\n' "$1" | tee -a "$LOG_FILE"; }
+warn() { printf '[WARN]   %s\n' "$1" | tee -a "$LOG_FILE"; }
+err()  { printf '[ERROR]  %s\n' "$1" | tee -a "$LOG_FILE" >&2; exit 1; }
+
+fetch_url() {
+    local dst="$1"
+    local url="$2"
+    wget -4 -q -T 20 -O "$dst" "$url" 2>/dev/null || wget -q -T 20 -O "$dst" "$url" 2>/dev/null
+}
+
+atomic_install() {
+    local src="$1"
+    local dst="$2"
+    local mode="$3"
+    local tmp_dst="${dst}.jio-new.$$"
+    cp -f "$src" "$tmp_dst"
+    chmod "$mode" "$tmp_dst"
+    mv -f "$tmp_dst" "$dst"
+}
 
 usage() {
     cat << 'EOF'
 Usage: jio-airfiber-5g-wan.sh [OPTIONS]
 
 Options:
-  -m, --mac <MAC>        WAN MAC address to clone (e.g., "00:1A:79:b6:56:6c")
-      --mode <MODE>      WAN mode: "untagged" (default) or "vlan1015"
-      --untagged         Shorthand for --mode untagged (default / bridge ODU)
-      --vlan1015         Shorthand for --mode vlan1015 (standard Jio AirFiber ODU)
-      --led              Install WAN Status LED monitor daemon (default)
-      --no-led           Skip WAN Status LED monitor daemon
-      --odhcp6c-fix      Force applying mt7986 (aarch64) odhcp6c bundle
-      --no-odhcp6c-fix   Skip applying mt7986 (aarch64) odhcp6c bundle
-  -y, --yes              Non-interactive mode (accept defaults for unset options)
-  -h, --help             Show this help message
-
-Examples:
-  /tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio-airfiber-5g-wan.sh --mac "00:1A:79:b6:56:6c"
-  /tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:1A:79:b6:56:6c" --led
-  /tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio-airfiber-5g-wan.sh --vlan1015 --mac "00:1A:79:b6:56:6c" --led
+  --mac <MAC>              WAN MAC address to clone (e.g. "00:1A:79:b6:56:6c")
+  --mode <mode>            WAN mode: "untagged" (default) or "vlan1015"
+  --untagged               Shorthand for --mode untagged
+  --vlan1015               Shorthand for --mode vlan1015
+  --nat64-prefix <PREFIX>  NAT64 IPv6 prefix (default: 64:ff9b::/96)
+  --led                    Install WAN status LED daemon (default)
+  --no-led                 Skip WAN status LED daemon
+  --odhcp6c-fix            Force applying mt7986 (aarch64) odhcp6c bundle
+  --no-odhcp6c-fix         Skip applying odhcp6c bundle
+  --no-restart             Do not trigger network restart (apply via reboot later)
+  -y, --yes                Non-interactive mode (use defaults for unspecified options)
+  -h, --help               Show this help message
 EOF
     exit 0
 }
 
-# --- 0. Parse CLI Arguments ---
+# --- Parse CLI Arguments ---
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        -m|--mac)
+        --mac|-m)
             [ "$#" -ge 2 ] || err "Option $1 requires a MAC address."
             WAN_MAC="$2"
             shift 2
@@ -89,6 +112,15 @@ while [ "$#" -gt 0 ]; do
             WAN_MODE="vlan1015"
             shift
             ;;
+        --nat64-prefix)
+            [ "$#" -ge 2 ] || err "Option --nat64-prefix requires an IPv6 prefix."
+            NAT64_PREFIX="$2"
+            shift 2
+            ;;
+        --nat64-prefix=*)
+            NAT64_PREFIX="${1#*=}"
+            shift
+            ;;
         --led)
             ENABLE_WAN_LED="1"
             shift
@@ -105,6 +137,10 @@ while [ "$#" -gt 0 ]; do
             APPLY_ODHCP6C_FIX="0"
             shift
             ;;
+        --no-restart)
+            NO_RESTART="1"
+            shift
+            ;;
         -y|--yes)
             NON_INTERACTIVE=1
             shift
@@ -113,13 +149,15 @@ while [ "$#" -gt 0 ]; do
             usage
             ;;
         *)
-            err "Unknown option: $1 (use --help for usage)"
+            err "Unknown argument: $1 (use --help for usage)"
             ;;
     esac
 done
 
 # --- 1. Pre-flight Checks & Release Detection ---
-[ "$(id -u)" -eq 0 ] || err "Run this script as root."
+if [ "$(id -u)" -ne 0 ]; then
+    err "Run this script as root."
+fi
 
 ARCH="$(uname -m)"
 OPENWRT_REV="unknown"
@@ -137,7 +175,9 @@ case "$OPENWRT_REV $OPENWRT_DESC" in
         IS_OFFICIAL=0
         ;;
     *)
-        [ "$OPENWRT_REV" != "unknown" ] && [ -n "$OPENWRT_REV" ] && IS_OFFICIAL=1
+        if [ "$OPENWRT_REV" != "unknown" ] && [ -n "$OPENWRT_REV" ]; then
+            IS_OFFICIAL=1
+        fi
         ;;
 esac
 
@@ -162,7 +202,7 @@ if ! ip route help 2>&1 | grep -qi "advmss"; then
     warn "ip-tiny / ip-full not detected; BusyBox ip may ignore advmss. Install 'ip-tiny' for full MTU/MSS support."
 fi
 
-# --- 2. Interactive Prompts (only for unset options when interactive) ---
+# --- 2. Interactive Prompts (only for options not supplied via CLI/env) ---
 if [ -z "$WAN_MODE" ]; then
     if [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 0 ]; then
         printf '\nSelect WAN Mode:\n  1) Untagged wan (default / bridge ODU)\n  2) VLAN 1015 (wan.1015 / standard Jio AirFiber ODU)\nChoice [1]: '
@@ -208,17 +248,15 @@ if [ -z "$APPLY_ODHCP6C_FIX" ] || [ "$APPLY_ODHCP6C_FIX" = "auto" ]; then
     fi
 fi
 
-# Validate MAC format if provided
 if [ -n "$WAN_MAC" ]; then
     if ! echo "$WAN_MAC" | grep -Eq '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
         err "Invalid MAC address format: $WAN_MAC"
     fi
 fi
 
-log "Mode: $WAN_MODE | MAC Clone: ${WAN_MAC:-none} | WAN LED: $ENABLE_WAN_LED | Official odhcp6c Fix: $APPLY_ODHCP6C_FIX"
+log "Mode: $WAN_MODE | MAC Clone: ${WAN_MAC:-none} | NAT64: $NAT64_PREFIX | WAN LED: $ENABLE_WAN_LED | Official odhcp6c Fix: $APPLY_ODHCP6C_FIX"
 
-# --- 3. Apply mt7986 odhcp6c Bundle on Official Firmware ---
-# Runs BEFORE modifying network/firewall/DNS so temporary external Wi-Fi (wwan) stays online.
+# --- 3. Atomically Apply mt7986 odhcp6c Bundle on Official Firmware ---
 if [ "$APPLY_ODHCP6C_FIX" = "1" ]; then
     if [ "$ARCH" != "aarch64" ]; then
         warn "Skipping odhcp6c bundle: prebuilt binary is for aarch64 (mt7986), detected $ARCH."
@@ -242,24 +280,23 @@ if [ "$APPLY_ODHCP6C_FIX" = "1" ]; then
             cp -f "$LOCAL_FOUND/dhcpv6.script" "$TMP_ODHCP/dhcpv6.script"
             FETCH_OK=1
         else
-            log "Downloading mt7986 odhcp6c bundle over IPv4 from GitHub ($REPO_RAW_BASE)..."
-            if wget -4 -q -T 20 -O "$TMP_ODHCP/dhcpv6.sh" "$REPO_RAW_BASE/files/odhcp6c/dhcpv6.sh" && \
-               wget -4 -q -T 20 -O "$TMP_ODHCP/dhcpv6.script" "$REPO_RAW_BASE/files/odhcp6c/dhcpv6.script" && \
-               wget -4 -q -T 20 -O "$TMP_ODHCP/odhcp6c" "$REPO_RAW_BASE/files/odhcp6c/odhcp6c"; then
+            log "Downloading mt7986 odhcp6c bundle from GitHub ($REPO_RAW_BASE)..."
+            if fetch_url "$TMP_ODHCP/dhcpv6.sh" "$REPO_RAW_BASE/files/odhcp6c/dhcpv6.sh" && \
+               fetch_url "$TMP_ODHCP/dhcpv6.script" "$REPO_RAW_BASE/files/odhcp6c/dhcpv6.script" && \
+               fetch_url "$TMP_ODHCP/odhcp6c" "$REPO_RAW_BASE/files/odhcp6c/odhcp6c"; then
                 FETCH_OK=1
-            elif wget -4 -q -T 20 -O "$TMP_ODHCP/dhcpv6.sh" "$REPO_RAW_BASE/files/dhcpv6.sh" && \
-                 wget -4 -q -T 20 -O "$TMP_ODHCP/dhcpv6.script" "$REPO_RAW_BASE/files/dhcpv6.script" && \
-                 wget -4 -q -T 20 -O "$TMP_ODHCP/odhcp6c" "$REPO_RAW_BASE/files/odhcp6c"; then
+            elif fetch_url "$TMP_ODHCP/dhcpv6.sh" "$REPO_RAW_BASE/files/dhcpv6.sh" && \
+                 fetch_url "$TMP_ODHCP/dhcpv6.script" "$REPO_RAW_BASE/files/dhcpv6.script" && \
+                 fetch_url "$TMP_ODHCP/odhcp6c" "$REPO_RAW_BASE/files/odhcp6c"; then
                 FETCH_OK=1
             fi
         fi
 
         if [ "$FETCH_OK" -ne 1 ]; then
             rm -rf "$TMP_ODHCP"
-            err "Could not locate local files/odhcp6c/* or download from GitHub. Verify /tmp extraction or internet access."
+            err "Could not locate local files/odhcp6c/* or download from GitHub."
         fi
 
-        # Validate ELF binary and shell scripts before overwriting system files
         if ! [ -s "$TMP_ODHCP/odhcp6c" ] || [ "$(head -c 4 "$TMP_ODHCP/odhcp6c" | tr -dc 'A-Z')" != "ELF" ]; then
             rm -rf "$TMP_ODHCP"
             err "odhcp6c is not a valid ELF binary. Aborting without modifying system files."
@@ -272,23 +309,25 @@ if [ "$APPLY_ODHCP6C_FIX" = "1" ]; then
             err "dhcpv6.sh or dhcpv6.script is invalid. Aborting without modifying system files."
         fi
 
-        # Preserve stock Official files once (never overwrite an existing backup)
         if [ ! -d "$BACKUP_DIR" ]; then
             log "Backing up stock Official odhcp6c files to $BACKUP_DIR..."
             mkdir -p "$BACKUP_DIR"
-            [ -f /usr/sbin/odhcp6c ] && cp -f /usr/sbin/odhcp6c "$BACKUP_DIR/odhcp6c"
-            [ -f /lib/netifd/proto/dhcpv6.sh ] && cp -f /lib/netifd/proto/dhcpv6.sh "$BACKUP_DIR/dhcpv6.sh"
-            [ -f /lib/netifd/dhcpv6.script ] && cp -f /lib/netifd/dhcpv6.script "$BACKUP_DIR/dhcpv6.script"
+            if [ -f /usr/sbin/odhcp6c ]; then cp -f /usr/sbin/odhcp6c "$BACKUP_DIR/odhcp6c"; fi
+            if [ -f /lib/netifd/proto/dhcpv6.sh ]; then cp -f /lib/netifd/proto/dhcpv6.sh "$BACKUP_DIR/dhcpv6.sh"; fi
+            if [ -f /lib/netifd/dhcpv6.script ]; then cp -f /lib/netifd/dhcpv6.script "$BACKUP_DIR/dhcpv6.script"; fi
         fi
 
-        log "Applying mt7986 odhcp6c, dhcpv6.sh, and dhcpv6.script (chmod 0755)..."
-        cp -f "$TMP_ODHCP/odhcp6c" /usr/sbin/odhcp6c
-        cp -f "$TMP_ODHCP/dhcpv6.sh" /lib/netifd/proto/dhcpv6.sh
-        cp -f "$TMP_ODHCP/dhcpv6.script" /lib/netifd/dhcpv6.script
-        chmod 0755 /usr/sbin/odhcp6c /lib/netifd/proto/dhcpv6.sh /lib/netifd/dhcpv6.script
+        log "Atomically installing odhcp6c, dhcpv6.sh, and dhcpv6.script (chmod 0755)..."
+        atomic_install "$TMP_ODHCP/odhcp6c" /usr/sbin/odhcp6c 0755
+        atomic_install "$TMP_ODHCP/dhcpv6.sh" /lib/netifd/proto/dhcpv6.sh 0755
+        atomic_install "$TMP_ODHCP/dhcpv6.script" /lib/netifd/dhcpv6.script 0755
         rm -rf "$TMP_ODHCP"
 
-        log "Official firmware odhcp6c fix applied! Stock backup saved in $BACKUP_DIR."
+        if ! (cd /lib/netifd/proto && ./dhcpv6.sh "" dump 2>/dev/null | grep -q '"dhcpv6"'); then
+            err "dhcpv6.sh protocol dump test failed after installation!"
+        fi
+
+        log "Official firmware odhcp6c fix installed & verified (backup in $BACKUP_DIR)."
     fi
 fi
 
@@ -297,27 +336,25 @@ log "Configuring /etc/config/network..."
 
 uci set network.globals.packet_steering='1'
 
-# Reuse existing 'wan' device section if present to avoid duplicate UCI blocks
-WAN_DEV_SEC=""
-for sec in $(uci show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
-    if [ "$(uci -q get "network.${sec}.name" || true)" = "wan" ]; then
-        WAN_DEV_SEC="$sec"
-        break
+STOCK_WAN_MAC=""
+WAN_SECS="$(uci show network 2>/dev/null | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='wan'$/\1/p" | awk '{a[NR]=$0} END {for(i=NR;i>=1;i--) print a[i]}' || true)"
+for sec in $WAN_SECS; do
+    if [ -z "$STOCK_WAN_MAC" ]; then
+        STOCK_WAN_MAC="$(uci -q get "network.$sec.macaddr" || true)"
     fi
+    uci -q delete "network.$sec" || true
 done
 
-if [ -z "$WAN_DEV_SEC" ]; then
-    WAN_DEV_SEC="wan_dev"
-    uci set "network.${WAN_DEV_SEC}=device"
-    uci set "network.${WAN_DEV_SEC}.name=wan"
-elif [ "$WAN_DEV_SEC" != "wan_dev" ]; then
-    uci -q delete network.wan_dev || true
-fi
-
-uci set "network.${WAN_DEV_SEC}.promisc=1"
-uci -q delete "network.${WAN_DEV_SEC}.mtu" || true
+uci set network.wan_dev=device
+uci set network.wan_dev.name='wan'
+uci set network.wan_dev.promisc='1'
+uci -q delete network.wan_dev.mtu || true
 if [ -n "$WAN_MAC" ]; then
-    uci set "network.${WAN_DEV_SEC}.macaddr=$WAN_MAC"
+    uci set network.wan_dev.macaddr="$WAN_MAC"
+elif [ -n "$STOCK_WAN_MAC" ]; then
+    uci set network.wan_dev.macaddr="$STOCK_WAN_MAC"
+else
+    uci -q delete network.wan_dev.macaddr || true
 fi
 
 if [ "$WAN_MODE" = "vlan1015" ]; then
@@ -338,13 +375,11 @@ else
     uci -q delete network.wan_1015 || true
 fi
 
-# Silence unused IPv4 DHCP polling on wan (does not touch external Wi-Fi wwan)
 if uci -q get network.wan >/dev/null; then
     uci set network.wan.auto='0'
     uci set network.wan.peerdns='0'
 fi
 
-# Configure wan6 (SLAAC / DHCPv6) and disable duplicate auto-spawned 464-wan6_4
 uci set network.wan6=interface
 uci set network.wan6.proto='dhcpv6'
 uci set network.wan6.device="$WAN6_DEV"
@@ -354,14 +389,14 @@ uci set network.wan6.peerdns='0'
 uci set network.wan6.auto='1'
 uci set network.wan6.iface_464xlat='0'
 
-# Configure managed 464XLAT (clat) with explicit Jio NAT64 prefix
 uci set network.clat=interface
 uci set network.clat.proto='464xlat'
 uci set network.clat.tunlink='wan6'
-uci set network.clat.ip6prefix="$CLAT_NAT64_PREFIX"
+uci set network.clat.ip6prefix="$NAT64_PREFIX"
 uci set network.clat.mtu="$CLAT_DEV_MTU"
 uci set network.clat.peerdns='0'
 uci set network.clat.zone='wan'
+uci set network.clat.auto='1'
 uci -q delete network.clat.ip6addr || true
 
 uci commit network
@@ -540,76 +575,100 @@ EOF
     /etc/init.d/jio-wan-led restart
 fi
 
-# --- 9. Sysupgrade Persistence ---
+# --- 9. Sysupgrade Persistence & Flash Sync ---
 log "Updating /etc/sysupgrade.conf..."
 for f in \
     /etc/hotplug.d/iface/99-clat-mtu \
     /etc/nftables.d/99-clat-mss.nft \
     /usr/bin/jio-wan-led.sh \
     /etc/init.d/jio-wan-led; do
-    [ -e "$f" ] || continue
-    grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null || echo "$f" >> /etc/sysupgrade.conf
+    if [ -e "$f" ]; then
+        grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null || echo "$f" >> /etc/sysupgrade.conf
+    fi
 done
 
 if [ -d "$BACKUP_DIR" ]; then
     for f in /usr/sbin/odhcp6c /lib/netifd/proto/dhcpv6.sh /lib/netifd/dhcpv6.script; do
-        [ -e "$f" ] && (grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null || echo "$f" >> /etc/sysupgrade.conf)
+        if [ -e "$f" ]; then
+            grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null || echo "$f" >> /etc/sysupgrade.conf
+        fi
     done
 fi
 
-# --- 10. Restart Services & Verify ---
-log "Restarting odhcpd, dnsmasq, firewall, and network (netifd)..."
+sync
+
+# --- 10. Reload Non-SSH-Disrupting Services ---
+log "Restarting odhcpd, dnsmasq, and firewall (SSH stays connected)..."
 /etc/init.d/odhcpd restart
 /etc/init.d/dnsmasq restart
 /etc/init.d/firewall restart
-/etc/init.d/network restart
-sleep 4
 
-if ubus call network get_proto_handlers 2>/dev/null | grep -q '"dhcpv6"'; then
-    log "netifd protocol registration: dhcpv6 OK"
-else
-    warn "dhcpv6 protocol handler not detected in netifd — check chmod 0755 on /lib/netifd/proto/dhcpv6.sh"
-fi
+# --- 11. Pre-Restart Verification Checklist (100% written to flash!) ---
+log "=== All Files & Configs Committed to Flash ==="
+log "  wan6: device=$(uci -q get network.wan6.device) | iface_464xlat=$(uci -q get network.wan6.iface_464xlat)"
+log "  clat: proto=$(uci -q get network.clat.proto) | ip6prefix=$(uci -q get network.clat.ip6prefix) | mtu=$(uci -q get network.clat.mtu)"
+log "  wan_dev: macaddr=$(uci -q get network.wan_dev.macaddr || echo factory) | promisc=$(uci -q get network.wan_dev.promisc)"
+log "  firewall: flow_offloading=$(uci -q get firewall.@defaults[0].flow_offloading) | mss_clamp=$(nft list chain inet fw4 clat_mss_clamp >/dev/null 2>&1 && echo OK || echo PENDING)"
+log "  dhcpv6.sh perms: $(ls -l /lib/netifd/proto/dhcpv6.sh | awk '{print $1}')"
+log "  setup log: $LOG_FILE"
 
-WAN_CARRIER="$(cat /sys/class/net/wan/carrier 2>/dev/null || echo 0)"
-
-if [ "$WAN_CARRIER" = "1" ]; then
-    log "WAN Ethernet link detected — waiting up to 60s for Jio 5G RA & 464-clat..."
-    WAITED=0
-    while [ "$WAITED" -lt 60 ]; do
-        if ip link show dev 464-clat >/dev/null 2>&1; then
-            break
-        fi
-        sleep 5
-        WAITED=$((WAITED + 5))
-    done
-
-    if ip link show dev 464-clat >/dev/null 2>&1; then
-        ip link set dev 464-clat mtu "$CLAT_DEV_MTU" 2>/dev/null || true
-        ip route replace default dev 464-clat metric 2048 mtu "$CLAT_ROUTE_MTU" advmss "$CLAT_TCP_MSS" 2>/dev/null || true
-    fi
-
-    log "=== Verification Summary ==="
-    ifstatus wan6 | grep -E '"up"|"proto"|"device"|"address"' || true
-    ip link show dev 464-clat 2>/dev/null | grep -o 'mtu [0-9]*' || echo "464-clat: still initializing (Jio RA can take up to 90s; check again shortly)"
-    ip route show dev 464-clat 2>/dev/null || true
-    ping -6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && log "IPv6 Reachability: OK" || warn "IPv6 Reachability: waiting on Jio RA"
-    ping -4 -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && log "IPv4 (464-clat) Reachability: OK" || warn "IPv4 (464-clat) Reachability: waiting on 464-clat"
-else
-    log "=== Installation Complete (WAN cable not plugged in yet) ==="
-    log "Next steps if you installed over an external Wi-Fi client (wwan):"
-    log "  1. Remove/disable your temporary external Wi-Fi client (wwan) in LuCI."
-    log "  2. Plug the Jio AirFiber 5G ODU Ethernet cable into the router WAN port."
-    log "  3. Reboot the router: reboot"
+if uci -q get network.wwan >/dev/null 2>&1; then
+    log "Note: Temporary 'wwan' interface detected. Disable/remove 'wwan' in LuCI when ready, plug in Jio 5G ODU, and reboot."
 fi
 
 if [ -d "$BACKUP_DIR" ]; then
-    log "Rollback commands for stock Official odhcp6c (if ever needed):"
-    log "  cp -f $BACKUP_DIR/odhcp6c /usr/sbin/odhcp6c"
-    log "  cp -f $BACKUP_DIR/dhcpv6.sh /lib/netifd/proto/dhcpv6.sh"
-    log "  cp -f $BACKUP_DIR/dhcpv6.script /lib/netifd/dhcpv6.script"
-    log "  chmod 0755 /usr/sbin/odhcp6c /lib/netifd/proto/dhcpv6.sh /lib/netifd/dhcpv6.script"
-    log "  /etc/init.d/network restart"
+    log "Rollback stock Official odhcp6c anytime: $SCRIPT_DIR/apply-mt7986-odhcp6c.sh --rollback"
 fi
 
-log "Done! Your AP Wi-Fi settings were left untouched."
+# --- 12. Detached Background netifd Restart (Prevents SSH Disconnect From Killing Script) ---
+if [ "$NO_RESTART" = "1" ]; then
+    log "Skipped network restart (--no-restart). Run 'reboot' or '/etc/init.d/network restart' to activate."
+    exit 0
+fi
+
+log "Scheduling detached /etc/init.d/network restart in 3 seconds..."
+log "Your Wi-Fi / SSH session may briefly drop (~10-15s) while netifd reloads."
+log "After reconnecting, check: cat $RESTART_LOG"
+
+(
+    trap '' HUP
+    sleep 3
+    {
+        echo "[$(date)] Starting /etc/init.d/network restart..."
+        /etc/init.d/network restart
+        sleep 4
+        if ubus call network get_proto_handlers 2>/dev/null | grep -q '"dhcpv6"'; then
+            echo "[$(date)] netifd protocol 'dhcpv6': REGISTERED"
+        else
+            echo "[$(date)] WARN: netifd protocol 'dhcpv6' not found!"
+        fi
+
+        WAN_CARRIER="$(cat /sys/class/net/wan/carrier 2>/dev/null || echo 0)"
+        if [ "$WAN_CARRIER" = "1" ]; then
+            ELAPSED=0
+            while [ "$ELAPSED" -lt 60 ]; do
+                if ip link show dev 464-clat >/dev/null 2>&1 && \
+                   ifstatus wan6 2>/dev/null | grep -q '"up": true'; then
+                    break
+                fi
+                sleep 3
+                ELAPSED=$((ELAPSED + 3))
+            done
+
+            if ip link show dev 464-clat >/dev/null 2>&1; then
+                ip link set dev 464-clat mtu "$CLAT_DEV_MTU" 2>/dev/null || true
+                ip route replace default dev 464-clat metric 2048 mtu "$CLAT_ROUTE_MTU" advmss "$CLAT_TCP_MSS" 2>/dev/null || true
+            fi
+
+            echo "[$(date)] === Post-Restart Status ==="
+            ifstatus wan6 2>/dev/null | grep -E '"up"|"proto"|"device"|"address"' || true
+            ip link show dev 464-clat 2>/dev/null | grep -o 'mtu [0-9]*' || echo "464-clat: waiting for Jio RA"
+            ip route show dev 464-clat 2>/dev/null || true
+        else
+            echo "[$(date)] WAN cable not connected yet. Plug in Jio 5G ODU and reboot."
+        fi
+        echo "[$(date)] Done."
+    } > "$RESTART_LOG" 2>&1
+) </dev/null >/dev/null 2>&1 &
+
+log "Setup finished cleanly (exit 0)! Wi-Fi AP settings were left untouched."
