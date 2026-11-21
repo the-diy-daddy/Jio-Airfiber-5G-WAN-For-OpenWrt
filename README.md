@@ -167,27 +167,27 @@ Pick **one** command below that matches your setup *(replace the MAC address wit
 Works for most Jio AirFiber 5G ODUs & bridge-mode setups. Automatically applies the Official 25.12.x `mt7986` `odhcp6c` fix, configures `wan6` + `clat` + split-MTU + `fw4` MSS clamping, and installs the WAN LED monitor:
 
 ```sh
-/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:1A:79:b6:56:6c" --led -y
+/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:AA:11:BB:22:CC" --led -y
 ```
 
 #### Option B — Installing Over Temporary `wwan` (No SSH Drop Until You Reboot)
 Same as Option A, but skips the immediate `netifd` restart so your SSH/LuCI session stays up while you remove `wwan` and plug in the Jio ODU:
 
 ```sh
-/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:1A:79:b6:56:6c" --led --no-restart -y
+/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:AA:11:BB:22:CC" --led --no-restart -y
 ```
 
 #### Option C — VLAN `1015` Mode (`wan.1015`)
 Use **only** if your specific Jio AirFiber ODU requires 802.1Q VLAN `1015` tagging on the Ethernet port:
 
 ```sh
-/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --vlan1015 --mac "00:1A:79:b6:56:6c" --led -y
+/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --vlan1015 --mac "00:AA:11:BB:22:CC" --led -y
 ```
 
 #### Option D — Interactive Mode (Guided Prompts)
 
 ```sh
-/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --mac "00:1A:79:b6:56:6c"
+/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --mac "00:AA:11:BB:22:CC"
 ```
 
 > [!IMPORTANT]
