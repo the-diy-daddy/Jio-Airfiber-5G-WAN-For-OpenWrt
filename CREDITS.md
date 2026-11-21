@@ -4,7 +4,7 @@
 
 ### Author & Maintainer
 - **The DIY Daddy** — [GitHub](https://github.com/the-diy-daddy) | [YouTube (@the_diy_daddy)](https://www.youtube.com/@the_diy_daddy)
-  - Project author, hardware testing on MediaTek Filogic (`mt7986`) routers across OpenWrt Snapshot and Official 25.12.6, `mt7986` `odhcp6c` compatibility bundle (`files/`), first-boot `uci-defaults` Wi-Fi automation, and end-to-end verification on live Jio AirFiber 5G links.
+  - Project author, hardware testing on MediaTek Filogic (`mt7986`) routers across OpenWrt Snapshot and Official 25.12.6, `mt7986` `odhcp6c` compatibility bundle (`files/odhcp6c/`), first-boot `uci-defaults` Wi-Fi automation, and end-to-end verification on live Jio AirFiber 5G links.
 
 ### Special Thanks
 - **marufagul** — [github.com/marufagul/jio-airfiber-openwrt-5g-wan](https://github.com/marufagul/jio-airfiber-openwrt-5g-wan)
