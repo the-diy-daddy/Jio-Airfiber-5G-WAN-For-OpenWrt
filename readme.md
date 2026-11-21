@@ -188,16 +188,16 @@ Pass your Jio ODU / old router MAC address with `--mac` (or omit `--mac` to keep
 
 ```sh
 # Standard interactive run with MAC clone (auto-detects Official FW and applies odhcp6c fix)
-/tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio-airfiber-5g-wan.sh --mac "00:1A:79:b6:56:6c"
+/tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio_airfiber_5g_wan.sh --mac "00:1A:79:b6:56:6c"
 ```
 
 #### Unattended / Advanced Examples
 ```sh
 # Untagged WAN (bridge ODU) + MAC clone + WAN LED, no prompts
-/tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:1A:79:b6:56:6c" --led
+/tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio_airfiber_5g_wan.sh --untagged --mac "00:1A:79:b6:56:6c" --led
 
 # VLAN 1015 WAN (standard Jio AirFiber ODU) + MAC clone + WAN LED, no prompts
-/tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio-airfiber-5g-wan.sh --vlan1015 --mac "00:1A:79:b6:56:6c" --led
+/tmp/5g-wan-jio-airfiber-for-openwrt/scripts/jio_airfiber_5g_wan.sh --vlan1015 --mac "00:1A:79:b6:56:6c" --led
 ```
 
 | Flag | Description |
