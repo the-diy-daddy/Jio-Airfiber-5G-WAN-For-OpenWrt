@@ -4,7 +4,7 @@
 # Author: The DIY Daddy (https://github.com/the-diy-daddy)
 #
 # Usage:
-#   /tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --mac "00:1A:79:b6:56:6c"
+#   /tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:1A:79:b6:56:6c" --led -y
 #
 # Key guarantees:
 # - Ignores SIGHUP (trap '' HUP) and commits + syncs 100% of files & UCI configs
@@ -68,9 +68,9 @@ Usage: jio-airfiber-5g-wan.sh [OPTIONS]
 
 Options:
   --mac <MAC>              WAN MAC address to clone (e.g. "00:1A:79:b6:56:6c")
-  --mode <mode>            WAN mode: "untagged" (default) or "vlan1015"
-  --untagged               Shorthand for --mode untagged
-  --vlan1015               Shorthand for --mode vlan1015
+  --mode <mode>            WAN mode: "untagged" (recommended default) or "vlan1015"
+  --untagged               Shorthand for --mode untagged (recommended)
+  --vlan1015               Shorthand for --mode vlan1015 (only if ODU requires VLAN 1015)
   --nat64-prefix <PREFIX>  NAT64 IPv6 prefix (default: 64:ff9b::/96)
   --led                    Install WAN status LED daemon (default)
   --no-led                 Skip WAN status LED daemon
@@ -205,7 +205,7 @@ fi
 # --- 2. Interactive Prompts (only for options not supplied via CLI/env) ---
 if [ -z "$WAN_MODE" ]; then
     if [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 0 ]; then
-        printf '\nSelect WAN Mode:\n  1) Untagged wan (default / bridge ODU)\n  2) VLAN 1015 (wan.1015 / standard Jio AirFiber ODU)\nChoice [1]: '
+        printf '\nSelect WAN Mode:\n  1) Untagged wan (Recommended — works for most Jio AirFiber ODUs / Bridge mode)\n  2) VLAN 1015 / wan.1015 (Only if your ODU requires 802.1Q VLAN tagging)\nChoice [1]: '
         read -r CHOICE || CHOICE="1"
         case "$CHOICE" in
             2) WAN_MODE="vlan1015" ;;
@@ -294,7 +294,7 @@ if [ "$APPLY_ODHCP6C_FIX" = "1" ]; then
 
         if [ "$FETCH_OK" -ne 1 ]; then
             rm -rf "$TMP_ODHCP"
-            err "Could not locate local files/odhcp6c/* or download from GitHub."
+            err "Could not locate local files/ or download from GitHub."
         fi
 
         if ! [ -s "$TMP_ODHCP/odhcp6c" ] || [ "$(head -c 4 "$TMP_ODHCP/odhcp6c" | tr -dc 'A-Z')" != "ELF" ]; then

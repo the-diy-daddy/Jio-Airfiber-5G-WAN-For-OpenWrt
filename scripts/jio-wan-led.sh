@@ -1,8 +1,11 @@
 #!/bin/sh
-# Jio Airfiber 5G WAN For OpenWrt — WAN & 464XLAT Status LED Monitor (excludes Wi-Fi LEDs)
-# - Solid Green/Blue : Dual-stack IPv6 + 464XLAT IPv4 Online
-# - Slow Blink       : IPv6 Online, 464XLAT IPv4 Degraded/Down
-# - Solid Red / Fast : WAN Offline
+# ==============================================================================
+# Jio Airfiber 5G WAN For OpenWrt — WAN & 464XLAT Status LED Monitor
+# Excludes Wi-Fi LEDs completely.
+#   - Solid Green/Blue : Dual-stack IPv6 + 464XLAT IPv4 Online
+#   - Slow Blink       : IPv6 Online, 464XLAT IPv4 Degraded/Down
+#   - Solid Red / Fast : WAN Offline
+# ==============================================================================
 
 INTERVAL=15
 

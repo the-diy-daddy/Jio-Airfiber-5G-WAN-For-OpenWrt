@@ -1,6 +1,8 @@
 #!/bin/sh
+# ==============================================================================
 # Jio Airfiber 5G WAN For OpenWrt — First-Boot Wi-Fi Setup (uci-defaults)
-# Enables 2.4GHz & 5GHz Wi-Fi on boot with MT76 DHCP fix
+# Enables 2.4GHz & 5GHz Wi-Fi on first boot with MT76 DHCP fix.
+# ==============================================================================
 
 WIFI_SSID="OpenWrt-Jio5G"
 WIFI_KEY="12345678"

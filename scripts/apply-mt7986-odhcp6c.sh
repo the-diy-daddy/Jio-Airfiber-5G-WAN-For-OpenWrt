@@ -3,14 +3,15 @@
 # Jio Airfiber 5G WAN For OpenWrt — Standalone mt7986 odhcp6c Fix (Official FW)
 # Author: The DIY Daddy (https://github.com/the-diy-daddy)
 #
+# Note: scripts/jio-airfiber-5g-wan.sh already runs this patch automatically on
+# Official OpenWrt 25.12.x (aarch64). Use this standalone script only if you
+# want to apply the odhcp6c patch by itself or roll back to stock files.
+#
 # Usage:
 #   /tmp/jio-airfiber-5g-wan/scripts/apply-mt7986-odhcp6c.sh
 #   /tmp/jio-airfiber-5g-wan/scripts/apply-mt7986-odhcp6c.sh --force
 #   /tmp/jio-airfiber-5g-wan/scripts/apply-mt7986-odhcp6c.sh --no-restart
 #   /tmp/jio-airfiber-5g-wan/scripts/apply-mt7986-odhcp6c.sh --rollback
-#
-# - Uses trap '' HUP + atomic install (cp -> chmod 0755 -> mv -f) + detached
-#   background network restart so SSH disconnects never abort the update.
 # ==============================================================================
 
 set -eu
