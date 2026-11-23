@@ -209,16 +209,23 @@ probe_vlan_id() {
 
     if command -v odhcp6c >/dev/null 2>&1; then
         if [ -n "$probe_duid" ]; then
-            odhcp6c -s /bin/true -Nforce -P0 -c"$probe_duid" -t10 "$dev" >/dev/null 2>&1 &
+            odhcp6c -s /bin/true -Nforce -P0 -c"$probe_duid" -t12 "$dev" >/dev/null 2>&1 &
         else
-            odhcp6c -s /bin/true -Nforce -P0 -t10 "$dev" >/dev/null 2>&1 &
+            odhcp6c -s /bin/true -Nforce -P0 -t12 "$dev" >/dev/null 2>&1 &
         fi
         opid=$!
-        sleep 6
+        local w=0
+        while [ "$w" -lt 12 ]; do
+            if [ -f "$cap" ] && grep -qiE '2409:[0-9a-f:]+' "$cap" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+            w=$((w + 1))
+        done
         kill "$opid" 2>/dev/null || true
         wait "$opid" 2>/dev/null || true
     else
-        sleep 4
+        sleep 6
     fi
 
     if [ -n "$tpid" ]; then
@@ -275,8 +282,10 @@ probe_untagged_wan() {
         local cur_mac
         cur_mac="$(cat /sys/class/net/wan/address 2>/dev/null | tr 'A-F' 'a-f' || true)"
         if [ "$cur_mac" != "$(printf '%s' "$probe_mac" | tr 'A-F' 'a-f')" ]; then
+            ip link set dev wan down 2>/dev/null || true
             ip link set dev wan address "$probe_mac" 2>/dev/null || true
-            sleep 2
+            ip link set dev wan promisc on up 2>/dev/null || true
+            sleep 3
         fi
     fi
 
@@ -291,13 +300,20 @@ probe_untagged_wan() {
     ping -6 -I wan -c 2 -W 2 ff02::2 >"$ping_out" 2>&1 || true
 
     if command -v odhcp6c >/dev/null 2>&1; then
-        odhcp6c -s /bin/true -Ntry -P0 -t10 wan >/dev/null 2>&1 &
+        odhcp6c -s /bin/true -Ntry -P0 -t12 wan >/dev/null 2>&1 &
         opid=$!
-        sleep 6
+        local w=0
+        while [ "$w" -lt 12 ]; do
+            if [ -f "$cap" ] && grep -qiE '2409:[0-9a-f:]+' "$cap" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+            w=$((w + 1))
+        done
         kill "$opid" 2>/dev/null || true
         wait "$opid" 2>/dev/null || true
     else
-        sleep 5
+        sleep 6
     fi
 
     if [ -n "$tpid" ]; then
@@ -1014,6 +1030,7 @@ if [ -z "$PD_PREFIX" ]; then
     if [ -n "$CURRENT_IP6" ]; then
         uci -q delete network.clat.ip6addr || true
         uci commit network
+        ubus call network reload 2>/dev/null || true
         ifdown clat 2>/dev/null || true
         sleep 1
         ifup clat 2>/dev/null || true
@@ -1036,6 +1053,7 @@ elif ! grep -qiF "$TARGET_IP6" /proc/net/nat46/control 2>/dev/null; then
 fi
 
 if [ "$NEED_BOUNCE" -eq 1 ]; then
+    ubus call network reload 2>/dev/null || true
     ifdown clat 2>/dev/null || true
     sleep 1
     ifup clat 2>/dev/null || true
@@ -1073,6 +1091,9 @@ else
     uci set dhcp.lan.dhcpv6='server'
     uci set dhcp.lan.ra_slaac='1'
     uci -q delete dhcp.lan.ndp || true
+    uci -q delete dhcp.lan.ra_flags || true
+    uci add_list dhcp.lan.ra_flags='managed-config'
+    uci add_list dhcp.lan.ra_flags='other-config'
 fi
 
 # Advertise Google + Cloudflare IPv4 DNS to LAN DHCPv4 clients (Option 6)
