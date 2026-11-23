@@ -96,28 +96,28 @@ ssh root@192.168.1.1
 
 Run **one** command below directly over SSH — it installs missing packages (`464xlat`, `kmod-nat46`, `ip-tiny`, `luci-proto-ipv6`, `tcpdump-mini`), patches `odhcp6c` on Official 25.12.x `mt7986`, detects your ODU's WAN topology, installs both hotplug hooks (`98-clat-iapd` & `99-clat-mtu`), sets Google + Cloudflare DNS, and runs a live post-restart self-check *(replace the MAC with your paired Jio router's WAN MAC, or omit `--mac` to keep factory MAC)*:
 
-#### Option A — Recommended: 100% Automatic (`--auto` is the default with `-y`)
+#### Option A — Recommended: 100% Automatic (`--auto` is the default with `-y`) *(replace the MAC with your paired Jio router's WAN MAC, or omit `--mac` to keep factory MAC)*:
 
 ```sh
-wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --mac "AC:10:07:27:C0:D2" -y
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --mac "A1:B2:C3:D4:E5:F6" -y
 ```
 
-#### Option B — Force Untagged `wan` (SLAAC `/64` + IPv6 Relay)
+#### Option B — Force Untagged `wan` (SLAAC `/64` + IPv6 Relay) *(replace the MAC with your paired Jio router's WAN MAC, or omit `--mac` to keep factory MAC)*:
 
 ```sh
-wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --untagged --mac "00:1A:79:b6:56:6c" -y
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --untagged --mac "A1:B2:C3:D4:E5:F6" -y
 ```
 
-#### Option C — Force VLAN `1015` (Stateful DHCPv6 `IA_NA` + `IA_PD` + Auto `98-clat-iapd`)
+#### Option C — Force VLAN `1015` (Stateful DHCPv6 `IA_NA` + `IA_PD` + Auto `98-clat-iapd`) *(replace the MAC with your paired Jio router's WAN MAC, or omit `--mac` to keep factory MAC)*:
 
 ```sh
-wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --vlan 1015 --mac "AC:10:07:27:C0:D2" -y
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --vlan 1015 --mac "A1:B2:C3:D4:E5:F6" -y
 ```
 
-#### Option D — Force VLAN `960` or Any Custom VLAN ID
+#### Option D — Force VLAN `960` or Any Custom VLAN ID *(replace the MAC with your paired Jio router's WAN MAC, or omit `--mac` to keep factory MAC)*:
 
 ```sh
-wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --vlan 960 --mac "AC:10:07:27:C0:D2" -y
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --vlan 960 --mac "A1:B2:C3:D4:E5:F6" -y
 ```
 
 > [!TIP]
