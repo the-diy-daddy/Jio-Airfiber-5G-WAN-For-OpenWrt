@@ -18,7 +18,14 @@ set -eu
 trap '' HUP
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main}"
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR=""
+case "$0" in
+    */*)
+        if [ -d "$(dirname -- "$0")" ]; then
+            SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+        fi
+        ;;
+esac
 BACKUP_DIR="/root/odhcp6c-25.12.6-backup"
 TMP_DIR="/tmp/mt7986-odhcp6c-$$"
 RESTART_LOG="/tmp/jio-network-restart.log"
@@ -123,12 +130,14 @@ esac
 mkdir -p "$TMP_DIR"
 
 LOCAL_FOUND=""
+if [ -n "$SCRIPT_DIR" ]; then
 for candidate in "$SCRIPT_DIR/../files/odhcp6c" "$SCRIPT_DIR/../files"; do
     if [ -f "$candidate/odhcp6c" ] && [ -f "$candidate/dhcpv6.sh" ] && [ -f "$candidate/dhcpv6.script" ]; then
         LOCAL_FOUND="$candidate"
         break
     fi
 done
+fi
 
 if [ -n "$LOCAL_FOUND" ]; then
     log "Using local mt7986 odhcp6c bundle from $LOCAL_FOUND..."
@@ -179,4 +188,4 @@ done
 
 sync
 schedule_network_restart
-log "Done! To restore stock Official files later: $0 --rollback"
+log "Done! To restore stock Official files later: wget -4 -qO- $REPO_RAW_BASE/scripts/apply-mt7986-odhcp6c.sh | sh -s -- --rollback"

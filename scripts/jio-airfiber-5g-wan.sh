@@ -3,48 +3,84 @@
 # Jio Airfiber 5G WAN For OpenWrt (Official 25.12.x & Snapshot)
 # Author: The DIY Daddy (https://github.com/the-diy-daddy)
 #
-# Usage:
-#   /tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:1A:79:b6:56:6c" --led -y
+# Direct one-liner usage (no /tmp download required):
+#   wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --auto --mac "AC:10:07:27:C0:D2" --led -y
 #
 # Key guarantees:
-# - Ignores SIGHUP (trap '' HUP) and commits + syncs 100% of files & UCI configs
-#   BEFORE restarting netifd in a detached background job (so SSH never kills
-#   the script mid-update).
-# - Atomic ELF/script installation (cp -> chmod 0755 -> mv -f) avoids ETXTBSY
-#   ("Text file busy") when odhcp6c is already running.
-# - Sets wan6.iface_464xlat='0' and clat.ip6prefix='64:ff9b::/96' so a single
-#   464-clat interface comes up cleanly alongside private Cloudflare/Google DNS.
-# - Enforces 1280/1260/1220 split-MTU & fw4 MSS clamping, disables odhcpd NDP
-#   relay conflict and flow_offloading, enables packet_steering, and preserves
-#   everything in /etc/sysupgrade.conf.
+# - Runs directly via `wget -4 -qO- ... | sh -s -- ...` OR from a local clone.
+# - Automatically installs missing packages via apk/opkg (464xlat, kmod-nat46,
+#   ip-tiny, luci-proto-ipv6, plus tcpdump-mini when --auto VLAN detection runs).
+# - Supports automatic ODU VLAN detection (--auto), untagged SLAAC (--untagged),
+#   VLAN 1015 (--vlan1015 / --vlan 1015), VLAN 960 (--vlan960 / --vlan 960), or
+#   any custom 802.1Q VLAN ID (--vlan <ID>).
+# - For VLAN-tagged ODUs (DHCPv6 IA_NA + IA_PD): configures clean 802.1Q device
+#   (no promisc, mtu 1500), reqaddress='force', MAC-based DUID-LL clientid
+#   (00030001<mac>) to prevent BNG UnspecFail, lan.ip6assign='64', Allow-464XLAT
+#   firewall rule, and odhcpd server mode.
+# - For untagged ODUs (SLAAC-only /64): configures wan_dev (promisc='1') and
+#   odhcpd IPv6 relay (wan6 master -> lan) so LAN devices receive global 2409:: IPs.
+# - Enforces 1280/1260/1220 split-MTU + fw4 MSS clamping, Google + Cloudflare
+#   IPv4/IPv6 DNS on WAN, dnsmasq, and LAN, atomic 0755 mt7986 odhcp6c fix on
+#   Official 25.12.x, and detached SSH-safe netifd restart.
 # ==============================================================================
 
 set -eu
 trap '' HUP
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main}"
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR=""
+case "$0" in
+    */*)
+        if [ -d "$(dirname -- "$0")" ]; then
+            SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+        fi
+        ;;
+esac
+
 BACKUP_DIR="/root/odhcp6c-25.12.6-backup"
 LOG_FILE="/tmp/jio-5g-setup.log"
 RESTART_LOG="/tmp/jio-network-restart.log"
 
 # --- Configurable Defaults (override via CLI flags, env vars, or prompts) ---
-WAN_MODE="${WAN_MODE:-}"                   # "untagged" or "vlan1015"
-WAN_MAC="${WAN_MAC:-}"                     # e.g., "00:1A:79:b6:56:6c"
+WAN_MODE="${WAN_MODE:-}"                   # "auto", "untagged", or "vlan"
+WAN_VLAN_ID="${WAN_VLAN_ID:-}"             # e.g., "1015", "960", or any 1..4094
+WAN_MAC="${WAN_MAC:-}"                     # e.g., "AC:10:07:27:C0:D2"
+WAN_CLIENTID="${WAN_CLIENTID:-}"           # optional custom DHCPv6 DUID hex
 NAT64_PREFIX="${NAT64_PREFIX:-64:ff9b::/96}"
+IPV6_MODE="${IPV6_MODE:-auto}"             # "auto" (relay for untagged, server for VLAN IA_PD), "relay", or "server"
 ENABLE_WAN_LED="${ENABLE_WAN_LED:-}"       # "1" or "0"
 APPLY_ODHCP6C_FIX="${APPLY_ODHCP6C_FIX:-}" # "auto" (default), "1", or "0"
+AUTO_PKG_INSTALL="${AUTO_PKG_INSTALL:-1}"  # "1" (auto apk/opkg add) or "0"
 NO_RESTART="${NO_RESTART:-0}"
 NON_INTERACTIVE=0
+PKG_UPDATED=0
 CLAT_DEV_MTU="1280"
 CLAT_ROUTE_MTU="1260"
 CLAT_TCP_MSS="1220"
+DNS_V4_LIST="8.8.8.8 1.1.1.1 8.8.4.4 1.0.0.1"
+DNS_V4_CSV="8.8.8.8,1.1.1.1,8.8.4.4,1.0.0.1"
+DNS_V6_LIST="2001:4860:4860::8888 2606:4700:4700::1111 2001:4860:4860::8844 2606:4700:4700::1001"
 
 : > "$LOG_FILE" 2>/dev/null || true
 
 log()  { printf '[JIO-5G] %s\n' "$1" | tee -a "$LOG_FILE"; }
 warn() { printf '[WARN]   %s\n' "$1" | tee -a "$LOG_FILE"; }
 err()  { printf '[ERROR]  %s\n' "$1" | tee -a "$LOG_FILE" >&2; exit 1; }
+
+can_prompt() {
+    [ "$NON_INTERACTIVE" -eq 0 ] && { [ -t 0 ] || [ -r /dev/tty ]; }
+}
+
+read_prompt() {
+    local varname="$1"
+    if [ -t 0 ]; then
+        read -r "$varname" || eval "$varname=''"
+    elif [ -r /dev/tty ]; then
+        read -r "$varname" </dev/tty || eval "$varname=''"
+    else
+        eval "$varname=''"
+    fi
+}
 
 fetch_url() {
     local dst="$1"
@@ -62,22 +98,320 @@ atomic_install() {
     mv -f "$tmp_dst" "$dst"
 }
 
+pkg_installed() {
+    local pkg="$1"
+    if command -v apk >/dev/null 2>&1; then
+        apk info -e "$pkg" >/dev/null 2>&1
+    else
+        opkg status "$pkg" 2>/dev/null | grep -q "Status: install"
+    fi
+}
+
+install_packages() {
+    local missing=""
+    local p
+    for p in "$@"; do
+        if ! pkg_installed "$p"; then
+            missing="$missing $p"
+        fi
+    done
+
+    [ -n "$missing" ] || return 0
+
+    if [ "$AUTO_PKG_INSTALL" != "1" ]; then
+        warn "Skipping auto-install (--no-pkg-install). Missing:$missing"
+        return 1
+    fi
+
+    log "Installing missing packages:$missing..."
+    if command -v apk >/dev/null 2>&1; then
+        if [ "$PKG_UPDATED" -eq 0 ]; then
+            apk update >>"$LOG_FILE" 2>&1 || return 1
+            PKG_UPDATED=1
+        fi
+        # shellcheck disable=SC2086
+        apk add $missing >>"$LOG_FILE" 2>&1 || return 1
+    elif command -v opkg >/dev/null 2>&1; then
+        if [ "$PKG_UPDATED" -eq 0 ]; then
+            opkg update >>"$LOG_FILE" 2>&1 || return 1
+            PKG_UPDATED=1
+        fi
+        # shellcheck disable=SC2086
+        opkg install $missing >>"$LOG_FILE" 2>&1 || return 1
+    else
+        warn "Neither apk nor opkg found; cannot auto-install:$missing"
+        return 1
+    fi
+    return 0
+}
+
+mac_to_duid_ll() {
+    local hex
+    hex="$(printf '%s' "$1" | tr -d ':' | tr 'A-F' 'a-f')"
+    if [ "${#hex}" -eq 12 ]; then
+        printf '00030001%s' "$hex"
+    fi
+}
+
+validate_vlan_id() {
+    case "$1" in
+        ''|*[!0-9]*) err "Invalid VLAN ID '$1'. Must be an integer between 1 and 4094." ;;
+    esac
+    if [ "$1" -lt 1 ] || [ "$1" -gt 4094 ]; then
+        err "Invalid VLAN ID '$1'. Must be between 1 and 4094."
+    fi
+}
+
+# --- VLAN Auto-Detection (untagged vs VLAN 1015 / custom VLAN) ---
+probe_vlan_id() {
+    local vid="$1"
+    local probe_mac="$2"
+    local probe_duid="$3"
+    local dev="wan.${vid}"
+    local created=0
+    local cap="/tmp/jio-probe-v${vid}-$$.log"
+    local ping_out="/tmp/jio-ping-v${vid}-$$.log"
+    local score=0
+    local own_ll=""
+    local tpid=""
+    local opid=""
+
+    if ip link show dev "$dev" >/dev/null 2>&1 && ip -6 addr show dev "$dev" 2>/dev/null | grep -qi '2409:'; then
+        echo 3
+        return 0
+    fi
+    if ! ip link show dev "$dev" >/dev/null 2>&1; then
+        if ! ip link add link wan name "$dev" type vlan id "$vid" 2>/dev/null; then
+            echo 0
+            return 0
+        fi
+        created=1
+    fi
+    if [ -n "$probe_mac" ]; then
+        ip link set dev "$dev" address "$probe_mac" 2>/dev/null || true
+    fi
+    ip link set dev "$dev" mtu 1500 up 2>/dev/null || true
+    sleep 2
+
+    own_ll="$(ip -6 addr show dev "$dev" scope link 2>/dev/null | awk '/inet6 fe80/{sub(/\/.*/,"",$2); print tolower($2); exit}' || true)"
+
+    tcpdump -i wan -e -nn -vv -l "vlan ${vid} and (icmp6 or port 546 or port 547)" >"$cap" 2>/dev/null &
+    tpid=$!
+    sleep 1
+
+    ping -6 -I "$dev" -c 2 -W 2 ff02::2 >"$ping_out" 2>&1 || true
+
+    if command -v odhcp6c >/dev/null 2>&1; then
+        if [ -n "$probe_duid" ]; then
+            odhcp6c -s /bin/true -Nforce -P0 -c"$probe_duid" -t10 "$dev" >/dev/null 2>&1 &
+        else
+            odhcp6c -s /bin/true -Nforce -P0 -t10 "$dev" >/dev/null 2>&1 &
+        fi
+        opid=$!
+        sleep 6
+        kill "$opid" 2>/dev/null || true
+        wait "$opid" 2>/dev/null || true
+    else
+        sleep 4
+    fi
+
+    kill "$tpid" 2>/dev/null || true
+    wait "$tpid" 2>/dev/null || true
+
+    # Classify captured traffic on this VLAN:
+    # 3 = Confirmed Jio 5G global 2409: prefix in RA or DHCPv6
+    # 2 = Confirmed foreign IPv6 router / DHCPv6 server (excluding 2405:200:.../118 management-only)
+    # 1 = Management/ACS VLAN only (e.g., VLAN 960 advertising 2405:200:... /118)
+    # 0 = No foreign IPv6 response
+    if grep -qiE '2409:[0-9a-f:]+' "$cap" 2>/dev/null; then
+        score=3
+    elif grep -qiE '2405:200:[0-9a-f:]+/118' "$cap" 2>/dev/null; then
+        score=1
+    else
+        local foreign_ping=0
+        if [ -n "$own_ll" ]; then
+            if grep -i 'bytes from fe80::' "$ping_out" 2>/dev/null | grep -viF "$own_ll" >/dev/null 2>&1; then
+                foreign_ping=1
+            fi
+        elif grep -qi 'bytes from fe80::' "$ping_out" 2>/dev/null; then
+            foreign_ping=1
+        fi
+
+        if [ "$foreign_ping" -eq 1 ] || grep -qiE 'dhcp6 (advertise|reply)|router advertisement' "$cap" 2>/dev/null; then
+            score=2
+        fi
+    fi
+
+    rm -f "$cap" "$ping_out"
+    if [ "$created" -eq 1 ]; then
+        ip link del "$dev" 2>/dev/null || true
+    fi
+    echo "$score"
+}
+
+probe_untagged_wan() {
+    local cap="/tmp/jio-probe-untagged-$$.log"
+    local ping_out="/tmp/jio-ping-untagged-$$.log"
+    local own_ll=""
+    local tpid=""
+    local score=0
+
+    if ip -6 addr show dev wan 2>/dev/null | grep -qi '2409:'; then
+        echo 3
+        return 0
+    fi
+    own_ll="$(ip -6 addr show dev wan scope link 2>/dev/null | awk '/inet6 fe80/{sub(/\/.*/,"",$2); print tolower($2); exit}' || true)"
+
+    tcpdump -i wan -e -nn -vv -l 'not vlan and (icmp6 or port 546 or port 547)' >"$cap" 2>/dev/null &
+    tpid=$!
+    sleep 1
+    ping -6 -I wan -c 3 -W 2 ff02::2 >"$ping_out" 2>&1 || true
+    sleep 5
+    kill "$tpid" 2>/dev/null || true
+    wait "$tpid" 2>/dev/null || true
+
+    if grep -qiE '2409:[0-9a-f:]+' "$cap" 2>/dev/null; then
+        score=3
+    else
+        local foreign_ping=0
+        if [ -n "$own_ll" ]; then
+            if grep -i 'bytes from fe80::' "$ping_out" 2>/dev/null | grep -viF "$own_ll" >/dev/null 2>&1; then
+                foreign_ping=1
+            fi
+        elif grep -qi 'bytes from fe80::' "$ping_out" 2>/dev/null; then
+            foreign_ping=1
+        fi
+        if [ "$foreign_ping" -eq 1 ] || grep -qiE 'router advertisement|dhcp6 (advertise|reply)' "$cap" 2>/dev/null; then
+            score=2
+        fi
+    fi
+
+    rm -f "$cap" "$ping_out"
+    echo "$score"
+}
+
+detect_jio_wan_mode() {
+    log "Running automatic Jio ODU WAN / VLAN detection on 'wan'..."
+
+    ip link set dev wan promisc on up 2>/dev/null || true
+    sleep 2
+    local carrier
+    carrier="$(cat /sys/class/net/wan/carrier 2>/dev/null || echo 0)"
+    if [ "$carrier" != "1" ]; then
+        warn "No Ethernet link detected on 'wan' port (ODU not plugged in yet)."
+        warn "Defaulting to 'untagged'. Plug in the Jio ODU and re-run with --auto, or specify --vlan 1015 / --untagged."
+        WAN_MODE="untagged"
+        WAN_VLAN_ID=""
+        return 0
+    fi
+
+    if ! command -v tcpdump >/dev/null 2>&1; then
+        install_packages tcpdump-mini || install_packages tcpdump || warn "tcpdump unavailable; detection will rely on active IPv6 probing."
+    fi
+
+    local probe_mac="$WAN_MAC"
+    if [ -z "$probe_mac" ] && [ -r /sys/class/net/wan/address ]; then
+        probe_mac="$(cat /sys/class/net/wan/address)"
+    fi
+    local probe_duid="$WAN_CLIENTID"
+    if [ -z "$probe_duid" ] && [ -n "$probe_mac" ]; then
+        probe_duid="$(mac_to_duid_ll "$probe_mac")"
+    fi
+
+    # Passively discover any 802.1Q VLAN IDs announced by the ODU (10 seconds)
+    local discovered_vlans=""
+    if command -v tcpdump >/dev/null 2>&1; then
+        local sniff_file="/tmp/jio-vlan-sniff-$$.log"
+        log "Listening for 802.1Q VLAN tags on 'wan' (10s)..."
+        tcpdump -i wan -e -nn -l vlan >"$sniff_file" 2>/dev/null &
+        local spid=$!
+        sleep 10
+        kill "$spid" 2>/dev/null || true
+        wait "$spid" 2>/dev/null || true
+        discovered_vlans="$(grep -o 'vlan [0-9][0-9]*' "$sniff_file" 2>/dev/null | awk '{print $2}' | sort -nu | tr '\n' ' ' || true)"
+        rm -f "$sniff_file"
+    fi
+
+    # Always include 1015 as a standard Jio AirFiber probe candidate alongside passively discovered VLANs
+    local candidates="$discovered_vlans"
+    case " $candidates " in
+        *" 1015 "*) ;;
+        *) candidates="${candidates}1015 " ;;
+    esac
+    log "Probe candidates: untagged + VLANs [$(printf '%s' "$candidates" | sed 's/ $//')]"
+
+    local untagged_score=0
+    if command -v tcpdump >/dev/null 2>&1; then
+        untagged_score="$(probe_untagged_wan || echo 0)"
+        untagged_score="${untagged_score:-0}"
+    fi
+    log "  Probe untagged wan -> score=$untagged_score"
+
+    local best_vlan=""
+    local best_vlan_score=0
+    local vid vscore
+    for vid in $candidates; do
+        vscore="$(probe_vlan_id "$vid" "$probe_mac" "$probe_duid" || echo 0)"
+        vscore="${vscore:-0}"
+        log "  Probe VLAN $vid (wan.$vid) -> score=$vscore"
+        if [ "$vscore" -gt "$best_vlan_score" ]; then
+            best_vlan_score="$vscore"
+            best_vlan="$vid"
+        fi
+    done
+
+    # Decision: prefer confirmed 2409: internet (score 3), then active BNG/router (score 2).
+    # Never auto-pick management-only VLANs (score 1, e.g. 2405:200:.../118 on VLAN 960).
+    if [ "$best_vlan_score" -ge 3 ]; then
+        WAN_MODE="vlan"
+        WAN_VLAN_ID="$best_vlan"
+        log "Auto-detected Jio 5G Internet on VLAN $WAN_VLAN_ID (confirmed 2409: prefix)!"
+    elif [ "$untagged_score" -ge 3 ]; then
+        WAN_MODE="untagged"
+        WAN_VLAN_ID=""
+        log "Auto-detected Jio 5G Internet on untagged 'wan' (confirmed 2409: prefix)!"
+    elif [ "$best_vlan_score" -ge 2 ] && [ "$untagged_score" -lt 2 ]; then
+        WAN_MODE="vlan"
+        WAN_VLAN_ID="$best_vlan"
+        log "Auto-detected Jio 5G WAN on VLAN $WAN_VLAN_ID (active BNG response)."
+    elif [ "$untagged_score" -ge 2 ]; then
+        WAN_MODE="untagged"
+        WAN_VLAN_ID=""
+        log "Auto-detected Jio 5G WAN on untagged 'wan' (active IPv6 router response)."
+    else
+        warn "Could not confirm an active 2409: prefix on untagged or VLANs (ODU may still be booting or MAC-locked)."
+        warn "Defaulting to 'untagged'. You can override anytime with --vlan 1015, --vlan 960, or --untagged."
+        WAN_MODE="untagged"
+        WAN_VLAN_ID=""
+    fi
+}
+
 usage() {
     cat << 'EOF'
 Usage: jio-airfiber-5g-wan.sh [OPTIONS]
 
-Options:
-  --mac <MAC>              WAN MAC address to clone (e.g. "00:1A:79:b6:56:6c")
-  --mode <mode>            WAN mode: "untagged" (recommended default) or "vlan1015"
-  --untagged               Shorthand for --mode untagged (recommended)
-  --vlan1015               Shorthand for --mode vlan1015 (only if ODU requires VLAN 1015)
+WAN Mode Options:
+  --auto                   Auto-detect untagged vs VLAN ID on 'wan' (installs tcpdump-mini if needed)
+  --untagged               Untagged 'wan' mode (SLAAC /64 + IPv6 relay)
+  --vlan <ID>              802.1Q VLAN mode for any VLAN ID (e.g. --vlan 1015 or --vlan 960)
+  --vlan1015               Shorthand for --vlan 1015 (stateful DHCPv6 IA_NA + IA_PD)
+  --vlan960                Shorthand for --vlan 960
+  --mode <mode>            "auto", "untagged", "vlan1015", or "vlan960"
+
+Network & DNS Options:
+  --mac <MAC>              WAN MAC address to clone (e.g. "AC:10:07:27:C0:D2")
+  --clientid <HEX>         Custom DHCPv6 Client-ID / DUID hex (default in VLAN mode: 00030001<mac>)
   --nat64-prefix <PREFIX>  NAT64 IPv6 prefix (default: 64:ff9b::/96)
-  --led                    Install WAN status LED daemon (default)
-  --no-led                 Skip WAN status LED daemon
+  --ipv6-mode <mode>       LAN IPv6 mode: "auto" (default), "relay", or "server"
+                           ("auto" uses relay for untagged SLAAC, server for VLAN IA_PD)
+
+System & Execution Options:
+  --led / --no-led         Install (default) or skip WAN status LED daemon
   --odhcp6c-fix            Force applying mt7986 (aarch64) odhcp6c bundle
   --no-odhcp6c-fix         Skip applying odhcp6c bundle
+  --no-pkg-install         Skip automatic apk/opkg package installation
   --no-restart             Do not trigger network restart (apply via reboot later)
-  -y, --yes                Non-interactive mode (use defaults for unspecified options)
+  -y, --yes                Non-interactive mode (accept defaults for unspecified options)
   -h, --help               Show this help message
 EOF
     exit 0
@@ -95,21 +429,69 @@ while [ "$#" -gt 0 ]; do
             WAN_MAC="${1#*=}"
             shift
             ;;
+        --clientid)
+            [ "$#" -ge 2 ] || err "Option --clientid requires a hex DUID."
+            WAN_CLIENTID="$2"
+            shift 2
+            ;;
+        --clientid=*)
+            WAN_CLIENTID="${1#*=}"
+            shift
+            ;;
         --mode)
-            [ "$#" -ge 2 ] || err "Option --mode requires 'untagged' or 'vlan1015'."
-            WAN_MODE="$2"
+            [ "$#" -ge 2 ] || err "Option --mode requires 'auto', 'untagged', 'vlan1015', or 'vlan960'."
+            case "$2" in
+                auto)     WAN_MODE="auto"; WAN_VLAN_ID="" ;;
+                untagged) WAN_MODE="untagged"; WAN_VLAN_ID="" ;;
+                vlan1015) WAN_MODE="vlan"; WAN_VLAN_ID="1015" ;;
+                vlan960)  WAN_MODE="vlan"; WAN_VLAN_ID="960" ;;
+                *) err "Invalid --mode '$2'. Use auto, untagged, vlan1015, vlan960, or --vlan <ID>." ;;
+            esac
             shift 2
             ;;
         --mode=*)
-            WAN_MODE="${1#*=}"
+            val="${1#*=}"
+            case "$val" in
+                auto)     WAN_MODE="auto"; WAN_VLAN_ID="" ;;
+                untagged) WAN_MODE="untagged"; WAN_VLAN_ID="" ;;
+                vlan1015) WAN_MODE="vlan"; WAN_VLAN_ID="1015" ;;
+                vlan960)  WAN_MODE="vlan"; WAN_VLAN_ID="960" ;;
+                *) err "Invalid --mode='$val'. Use auto, untagged, vlan1015, vlan960, or --vlan <ID>." ;;
+            esac
+            shift
+            ;;
+        --auto)
+            WAN_MODE="auto"
+            WAN_VLAN_ID=""
             shift
             ;;
         --untagged)
             WAN_MODE="untagged"
+            WAN_VLAN_ID=""
+            shift
+            ;;
+        --vlan)
+            [ "$#" -ge 2 ] || err "Option --vlan requires a VLAN ID (1-4094)."
+            validate_vlan_id "$2"
+            WAN_MODE="vlan"
+            WAN_VLAN_ID="$2"
+            shift 2
+            ;;
+        --vlan=*)
+            val="${1#*=}"
+            validate_vlan_id "$val"
+            WAN_MODE="vlan"
+            WAN_VLAN_ID="$val"
             shift
             ;;
         --vlan1015)
-            WAN_MODE="vlan1015"
+            WAN_MODE="vlan"
+            WAN_VLAN_ID="1015"
+            shift
+            ;;
+        --vlan960)
+            WAN_MODE="vlan"
+            WAN_VLAN_ID="960"
             shift
             ;;
         --nat64-prefix)
@@ -119,6 +501,15 @@ while [ "$#" -gt 0 ]; do
             ;;
         --nat64-prefix=*)
             NAT64_PREFIX="${1#*=}"
+            shift
+            ;;
+        --ipv6-mode)
+            [ "$#" -ge 2 ] || err "Option --ipv6-mode requires 'auto', 'relay', or 'server'."
+            IPV6_MODE="$2"
+            shift 2
+            ;;
+        --ipv6-mode=*)
+            IPV6_MODE="${1#*=}"
             shift
             ;;
         --led)
@@ -135,6 +526,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-odhcp6c-fix)
             APPLY_ODHCP6C_FIX="0"
+            shift
+            ;;
+        --no-pkg-install)
+            AUTO_PKG_INSTALL="0"
             shift
             ;;
         --no-restart)
@@ -154,7 +549,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-# --- 1. Pre-flight Checks & Release Detection ---
+# --- 1. Pre-flight Checks, Release Detection & Auto Package Install ---
 if [ "$(id -u)" -ne 0 ]; then
     err "Run this script as root."
 fi
@@ -187,15 +582,19 @@ else
     log "Detected OpenWrt Snapshot Release: $OPENWRT_REV ($ARCH)"
 fi
 
+# Automatically download & install any missing required packages over temporary wwan/WAN
+if ! install_packages 464xlat kmod-nat46 ip-tiny luci-proto-ipv6; then
+    warn "Automatic package installation failed (check internet/wwan connectivity)."
+fi
+
 MISSING=""
 for pkg in 464xlat kmod-nat46; do
-    if ! opkg status "$pkg" 2>/dev/null | grep -q "Status: install" && \
-       ! apk info -e "$pkg" >/dev/null 2>&1; then
+    if ! pkg_installed "$pkg"; then
         MISSING="$MISSING $pkg"
     fi
 done
 if [ -n "$MISSING" ]; then
-    err "Missing required packages:$MISSING. Build with Firmware Selector or install them first."
+    err "Missing required packages:$MISSING. Connect temporary wwan internet or build with Firmware Selector."
 fi
 
 if ! ip route help 2>&1 | grep -qi "advmss"; then
@@ -204,33 +603,48 @@ fi
 
 # --- 2. Interactive Prompts (only for options not supplied via CLI/env) ---
 if [ -z "$WAN_MODE" ]; then
-    if [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 0 ]; then
-        printf '\nSelect WAN Mode:\n  1) Untagged wan (Recommended — works for most Jio AirFiber ODUs / Bridge mode)\n  2) VLAN 1015 / wan.1015 (Only if your ODU requires 802.1Q VLAN tagging)\nChoice [1]: '
-        read -r CHOICE || CHOICE="1"
-        case "$CHOICE" in
-            2) WAN_MODE="vlan1015" ;;
-            *) WAN_MODE="untagged" ;;
+    if can_prompt; then
+        printf '\nSelect Jio 5G WAN Mode:\n'
+        printf '  1) Auto-Detect VLAN / Untagged (Recommended when ODU is plugged into WAN)\n'
+        printf '  2) Untagged wan (SLAAC /64 + IPv6 relay)\n'
+        printf '  3) VLAN 1015 / wan.1015 (Stateful DHCPv6 IA_NA + IA_PD)\n'
+        printf '  4) VLAN 960  / wan.960\n'
+        printf '  5) Custom VLAN ID\n'
+        printf 'Choice [1]: '
+        read_prompt CHOICE
+        case "${CHOICE:-1}" in
+            2) WAN_MODE="untagged"; WAN_VLAN_ID="" ;;
+            3) WAN_MODE="vlan"; WAN_VLAN_ID="1015" ;;
+            4) WAN_MODE="vlan"; WAN_VLAN_ID="960" ;;
+            5)
+                printf 'Enter custom VLAN ID (1-4094): '
+                read_prompt WAN_VLAN_ID
+                validate_vlan_id "$WAN_VLAN_ID"
+                WAN_MODE="vlan"
+                ;;
+            *) WAN_MODE="auto"; WAN_VLAN_ID="" ;;
         esac
     else
-        WAN_MODE="untagged"
+        WAN_MODE="auto"
     fi
 fi
 
-case "$WAN_MODE" in
-    untagged|vlan1015) ;;
-    *) err "Invalid WAN mode '$WAN_MODE'. Must be 'untagged' or 'vlan1015'." ;;
-esac
+if [ -z "$WAN_MAC" ] && can_prompt; then
+    printf 'Enter Jio WAN MAC address to clone (leave blank to keep default): '
+    read_prompt WAN_MAC
+fi
 
-if [ -z "$WAN_MAC" ] && [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 0 ]; then
-    printf 'Enter WAN MAC address to clone (leave blank to keep default): '
-    read -r WAN_MAC || WAN_MAC=""
+if [ -n "$WAN_MAC" ]; then
+    if ! echo "$WAN_MAC" | grep -Eq '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
+        err "Invalid MAC address format: $WAN_MAC"
+    fi
 fi
 
 if [ -z "$ENABLE_WAN_LED" ]; then
-    if [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 0 ]; then
+    if can_prompt; then
         printf 'Install WAN Status LED monitor daemon? [Y/n]: '
-        read -r LED_ANS || LED_ANS="y"
-        case "$LED_ANS" in
+        read_prompt LED_ANS
+        case "${LED_ANS:-y}" in
             [nN]*) ENABLE_WAN_LED="0" ;;
             *)     ENABLE_WAN_LED="1" ;;
         esac
@@ -248,15 +662,13 @@ if [ -z "$APPLY_ODHCP6C_FIX" ] || [ "$APPLY_ODHCP6C_FIX" = "auto" ]; then
     fi
 fi
 
-if [ -n "$WAN_MAC" ]; then
-    if ! echo "$WAN_MAC" | grep -Eq '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
-        err "Invalid MAC address format: $WAN_MAC"
-    fi
-fi
-
-log "Mode: $WAN_MODE | MAC Clone: ${WAN_MAC:-none} | NAT64: $NAT64_PREFIX | WAN LED: $ENABLE_WAN_LED | Official odhcp6c Fix: $APPLY_ODHCP6C_FIX"
+case "$IPV6_MODE" in
+    auto|relay|server) ;;
+    *) err "Invalid IPv6 mode '$IPV6_MODE'. Must be 'auto', 'relay', or 'server'." ;;
+esac
 
 # --- 3. Atomically Apply mt7986 odhcp6c Bundle on Official Firmware ---
+# (Installed before --auto probing so probing uses the working odhcp6c binary)
 if [ "$APPLY_ODHCP6C_FIX" = "1" ]; then
     if [ "$ARCH" != "aarch64" ]; then
         warn "Skipping odhcp6c bundle: prebuilt binary is for aarch64 (mt7986), detected $ARCH."
@@ -266,12 +678,14 @@ if [ "$APPLY_ODHCP6C_FIX" = "1" ]; then
         FETCH_OK=0
 
         LOCAL_FOUND=""
-        for candidate in "$SCRIPT_DIR/../files/odhcp6c" "$SCRIPT_DIR/../files"; do
-            if [ -f "$candidate/odhcp6c" ] && [ -f "$candidate/dhcpv6.sh" ] && [ -f "$candidate/dhcpv6.script" ]; then
-                LOCAL_FOUND="$candidate"
-                break
-            fi
-        done
+        if [ -n "$SCRIPT_DIR" ]; then
+            for candidate in "$SCRIPT_DIR/../files/odhcp6c" "$SCRIPT_DIR/../files"; do
+                if [ -f "$candidate/odhcp6c" ] && [ -f "$candidate/dhcpv6.sh" ] && [ -f "$candidate/dhcpv6.script" ]; then
+                    LOCAL_FOUND="$candidate"
+                    break
+                fi
+            done
+        fi
 
         if [ -n "$LOCAL_FOUND" ]; then
             log "Using local mt7986 odhcp6c bundle from $LOCAL_FOUND..."
@@ -294,7 +708,7 @@ if [ "$APPLY_ODHCP6C_FIX" = "1" ]; then
 
         if [ "$FETCH_OK" -ne 1 ]; then
             rm -rf "$TMP_ODHCP"
-            err "Could not locate local files/ or download from GitHub."
+            err "Could not locate local files/ or download odhcp6c bundle from GitHub."
         fi
 
         if ! [ -s "$TMP_ODHCP/odhcp6c" ] || [ "$(head -c 4 "$TMP_ODHCP/odhcp6c" | tr -dc 'A-Z')" != "ELF" ]; then
@@ -331,10 +745,41 @@ if [ "$APPLY_ODHCP6C_FIX" = "1" ]; then
     fi
 fi
 
+# --- 3b. Run Auto-Detection if Requested ---
+if [ "$WAN_MODE" = "auto" ]; then
+    detect_jio_wan_mode
+fi
+
+case "$WAN_MODE" in
+    untagged)
+        EFFECTIVE_IPV6_MODE="$IPV6_MODE"
+        if [ "$EFFECTIVE_IPV6_MODE" = "auto" ]; then
+            EFFECTIVE_IPV6_MODE="relay"
+        fi
+        ;;
+    vlan)
+        validate_vlan_id "$WAN_VLAN_ID"
+        EFFECTIVE_IPV6_MODE="$IPV6_MODE"
+        if [ "$EFFECTIVE_IPV6_MODE" = "auto" ]; then
+            EFFECTIVE_IPV6_MODE="server"
+        fi
+        ;;
+    *)
+        err "Invalid WAN mode '$WAN_MODE'."
+        ;;
+esac
+
+log "Final Config -> Mode: $WAN_MODE${WAN_VLAN_ID:+ (VLAN $WAN_VLAN_ID)} | IPv6 LAN: $EFFECTIVE_IPV6_MODE | MAC: ${WAN_MAC:-default} | NAT64: $NAT64_PREFIX | LED: $ENABLE_WAN_LED"
+
 # --- 4. Configure Network Devices & Interfaces ---
 log "Configuring /etc/config/network..."
 
 uci set network.globals.packet_steering='1'
+
+# Clean up any prior script-managed VLAN / wan device entries to avoid duplicates
+for oldsec in wan_dev wan_vlan wan_1015 wan_vlan1015 wan_960 wan_vlan960; do
+    uci -q delete "network.$oldsec" || true
+done
 
 STOCK_WAN_MAC=""
 WAN_SECS="$(uci show network 2>/dev/null | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='wan'$/\1/p" | awk '{a[NR]=$0} END {for(i=NR;i>=1;i--) print a[i]}' || true)"
@@ -345,63 +790,132 @@ for sec in $WAN_SECS; do
     uci -q delete "network.$sec" || true
 done
 
-uci set network.wan_dev=device
-uci set network.wan_dev.name='wan'
-uci set network.wan_dev.promisc='1'
-uci -q delete network.wan_dev.mtu || true
-if [ -n "$WAN_MAC" ]; then
-    uci set network.wan_dev.macaddr="$WAN_MAC"
-elif [ -n "$STOCK_WAN_MAC" ]; then
-    uci set network.wan_dev.macaddr="$STOCK_WAN_MAC"
-else
-    uci -q delete network.wan_dev.macaddr || true
+EFFECTIVE_MAC="$WAN_MAC"
+if [ -z "$EFFECTIVE_MAC" ]; then
+    EFFECTIVE_MAC="$STOCK_WAN_MAC"
+fi
+if [ -z "$EFFECTIVE_MAC" ] && [ -r /sys/class/net/wan/address ]; then
+    EFFECTIVE_MAC="$(cat /sys/class/net/wan/address)"
 fi
 
-if [ "$WAN_MODE" = "vlan1015" ]; then
-    WAN6_DEV="wan.1015"
-    uci set network.wan_1015=device
-    uci set network.wan_1015.type='8021q'
-    uci set network.wan_1015.ifname='wan'
-    uci set network.wan_1015.vid='1015'
-    uci set network.wan_1015.name='wan.1015'
-    uci set network.wan_1015.promisc='1'
+if [ "$WAN_MODE" = "vlan" ]; then
+    WAN6_DEV="wan.${WAN_VLAN_ID}"
+
+    # VLAN-tagged Jio ODU (e.g. VLAN 1015): keep physical 'wan' clean (no promisc)
+    # and bind MAC + MTU 1500 directly on the 802.1Q VLAN device.
+    uci set network.wan_vlan=device
+    uci set network.wan_vlan.type='8021q'
+    uci set network.wan_vlan.ifname='wan'
+    uci set network.wan_vlan.vid="$WAN_VLAN_ID"
+    uci set network.wan_vlan.name="$WAN6_DEV"
+    uci set network.wan_vlan.mtu='1500'
     if [ -n "$WAN_MAC" ]; then
-        uci set network.wan_1015.macaddr="$WAN_MAC"
-    else
-        uci -q delete network.wan_1015.macaddr || true
+        uci set network.wan_vlan.macaddr="$WAN_MAC"
+    elif [ -n "$STOCK_WAN_MAC" ]; then
+        uci set network.wan_vlan.macaddr="$STOCK_WAN_MAC"
     fi
+
+    if uci -q get network.wan >/dev/null; then
+        uci set network.wan.auto='1'
+        uci set network.wan.peerdns='0'
+        uci -q delete network.wan.dns || true
+        for dns in $DNS_V4_LIST; do
+            uci add_list network.wan.dns="$dns"
+        done
+    fi
+
+    # Deterministic MAC-based DUID-LL prevents Jio BNG DHCPv6 UnspecFail
+    EFFECTIVE_CLIENTID="$WAN_CLIENTID"
+    if [ -z "$EFFECTIVE_CLIENTID" ] && [ -n "$EFFECTIVE_MAC" ]; then
+        EFFECTIVE_CLIENTID="$(mac_to_duid_ll "$EFFECTIVE_MAC")"
+    fi
+
+    uci set network.wan6=interface
+    uci set network.wan6.proto='dhcpv6'
+    uci set network.wan6.device="$WAN6_DEV"
+    uci set network.wan6.reqaddress='force'
+    uci set network.wan6.reqprefix='auto'
+    uci set network.wan6.delegate='1'
+    uci set network.wan6.metric='10'
+    uci set network.wan6.peerdns='0'
+    uci set network.wan6.auto='1'
+    uci set network.wan6.iface_464xlat='0'
+    if [ -n "$EFFECTIVE_CLIENTID" ]; then
+        uci set network.wan6.clientid="$EFFECTIVE_CLIENTID"
+    else
+        uci -q delete network.wan6.clientid || true
+    fi
+    uci -q delete network.wan6.dns || true
+    for dns6 in $DNS_V6_LIST; do
+        uci add_list network.wan6.dns="$dns6"
+    done
+
+    # Delegate IA_PD /64 directly to LAN
+    uci set network.lan.ip6assign='64'
 else
     WAN6_DEV="wan"
-    uci -q delete network.wan_1015 || true
-fi
 
-if uci -q get network.wan >/dev/null; then
-    uci set network.wan.auto='0'
-    uci set network.wan.peerdns='0'
-fi
+    # Untagged Jio ODU (SLAAC /64): promisc='1' prevents mt7530 Proxy NDP drops
+    uci set network.wan_dev=device
+    uci set network.wan_dev.name='wan'
+    uci set network.wan_dev.promisc='1'
+    uci -q delete network.wan_dev.mtu || true
+    if [ -n "$WAN_MAC" ]; then
+        uci set network.wan_dev.macaddr="$WAN_MAC"
+    elif [ -n "$STOCK_WAN_MAC" ]; then
+        uci set network.wan_dev.macaddr="$STOCK_WAN_MAC"
+    else
+        uci -q delete network.wan_dev.macaddr || true
+    fi
 
-uci set network.wan6=interface
-uci set network.wan6.proto='dhcpv6'
-uci set network.wan6.device="$WAN6_DEV"
-uci set network.wan6.reqaddress='try'
-uci set network.wan6.reqprefix='auto'
-uci set network.wan6.peerdns='0'
-uci set network.wan6.auto='1'
-uci set network.wan6.iface_464xlat='0'
+    if uci -q get network.wan >/dev/null; then
+        uci set network.wan.auto='0'
+        uci set network.wan.peerdns='0'
+        uci -q delete network.wan.dns || true
+        for dns in $DNS_V4_LIST; do
+            uci add_list network.wan.dns="$dns"
+        done
+    fi
+
+    uci set network.wan6=interface
+    uci set network.wan6.proto='dhcpv6'
+    uci set network.wan6.device="$WAN6_DEV"
+    uci set network.wan6.reqaddress='try'
+    uci set network.wan6.reqprefix='auto'
+    uci set network.wan6.peerdns='0'
+    uci set network.wan6.auto='1'
+    uci set network.wan6.iface_464xlat='0'
+    uci -q delete network.wan6.delegate || true
+    uci -q delete network.wan6.metric || true
+    if [ -n "$WAN_CLIENTID" ]; then
+        uci set network.wan6.clientid="$WAN_CLIENTID"
+    else
+        uci -q delete network.wan6.clientid || true
+    fi
+    uci -q delete network.wan6.dns || true
+    for dns6 in $DNS_V6_LIST; do
+        uci add_list network.wan6.dns="$dns6"
+    done
+fi
 
 uci set network.clat=interface
 uci set network.clat.proto='464xlat'
 uci set network.clat.tunlink='wan6'
 uci set network.clat.ip6prefix="$NAT64_PREFIX"
 uci set network.clat.mtu="$CLAT_DEV_MTU"
+uci set network.clat.metric='10'
 uci set network.clat.peerdns='0'
 uci set network.clat.zone='wan'
 uci set network.clat.auto='1'
 uci -q delete network.clat.ip6addr || true
+uci -q delete network.clat.dns || true
+for dns in $DNS_V4_LIST; do
+    uci add_list network.clat.dns="$dns"
+done
 
 uci commit network
 
-# --- 5. Firewall: Disable Flow Offloading, Ensure WAN Zone & MSS Clamp ---
+# --- 5. Firewall: Disable Flow Offloading, Allow-464XLAT & fw4 MSS Clamp ---
 log "Configuring /etc/config/firewall and fw4 MSS clamping..."
 
 uci set firewall.@defaults[0].flow_offloading='0'
@@ -425,6 +939,15 @@ if [ -n "$WAN_ZONE_IDX" ]; then
         esac
     done
 fi
+
+uci set firewall.allow_clat=rule
+uci set firewall.allow_clat.name='Allow-464XLAT'
+uci set firewall.allow_clat.src='wan'
+uci set firewall.allow_clat.dest='wan'
+uci set firewall.allow_clat.family='ipv6'
+uci set firewall.allow_clat.proto='all'
+uci set firewall.allow_clat.target='ACCEPT'
+
 uci commit firewall
 
 mkdir -p /etc/nftables.d
@@ -449,20 +972,45 @@ ip route replace default dev 464-clat metric 2048 mtu ${CLAT_ROUTE_MTU} advmss $
 EOF
 chmod 0755 /etc/hotplug.d/iface/99-clat-mtu
 
-# --- 7. DHCP & DNS: Prevent odhcpd Relay Conflict + Cloudflare/Google DNS ---
-log "Configuring dnsmasq (Cloudflare + Google DNS) and disabling odhcpd NDP relay conflict..."
+# --- 7. DHCP & DNS: IPv6 Relay / IA_PD Server + Google & Cloudflare DNS (WAN & LAN) ---
+if [ "$EFFECTIVE_IPV6_MODE" = "relay" ]; then
+    log "Configuring odhcpd IPv6 relay (wan6 master -> lan) + Google/Cloudflare IPv4 & IPv6 DNS..."
+    uci set dhcp.wan6=dhcp
+    uci set dhcp.wan6.interface='wan6'
+    uci set dhcp.wan6.ignore='1'
+    uci set dhcp.wan6.master='1'
+    uci set dhcp.wan6.ra='relay'
+    uci set dhcp.wan6.dhcpv6='relay'
+    uci set dhcp.wan6.ndp='relay'
 
-uci -q delete dhcp.wan6 || true
-uci set dhcp.lan.ra='server'
-uci set dhcp.lan.dhcpv6='server'
-uci set dhcp.lan.ndp='disabled'
+    uci set dhcp.lan.ra='relay'
+    uci set dhcp.lan.dhcpv6='relay'
+    uci set dhcp.lan.ndp='relay'
+else
+    log "Configuring odhcpd IPv6 server mode (native IA_PD /64 delegation) + Google/Cloudflare IPv4 & IPv6 DNS..."
+    uci -q delete dhcp.wan6 || true
+    uci set dhcp.lan.ra='server'
+    uci set dhcp.lan.dhcpv6='server'
+    uci set dhcp.lan.ra_slaac='1'
+    uci -q delete dhcp.lan.ndp || true
+fi
 
+# Advertise Google + Cloudflare IPv4 DNS to LAN DHCPv4 clients (Option 6)
+uci -q delete dhcp.lan.dhcp_option || true
+uci add_list dhcp.lan.dhcp_option="6,${DNS_V4_CSV}"
+
+# Advertise Google + Cloudflare IPv6 DNS to LAN clients (RDNSS / DHCPv6)
+uci -q delete dhcp.lan.dns || true
+for dns6 in $DNS_V6_LIST; do
+    uci add_list dhcp.lan.dns="$dns6"
+done
+uci set dhcp.lan.ra_dns='1'
+uci set dhcp.lan.dns_service='1'
+
+# Configure router dnsmasq upstream resolvers (Google + Cloudflare IPv4 & IPv6)
 uci set dhcp.@dnsmasq[0].noresolv='1'
 uci -q delete dhcp.@dnsmasq[0].server || true
-for dns in \
-    1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4 \
-    2606:4700:4700::1111 2001:4860:4860::8888 \
-    2606:4700:4700::1001 2001:4860:4860::8844; do
+for dns in $DNS_V4_LIST $DNS_V6_LIST; do
     uci add_list dhcp.@dnsmasq[0].server="$dns"
 done
 uci commit dhcp
@@ -572,7 +1120,8 @@ start_service() {
 EOF
     chmod 0755 /etc/init.d/jio-wan-led
     /etc/init.d/jio-wan-led enable
-    /etc/init.d/jio-wan-led restart
+    /etc/init.d/jio-wan-led stop 2>/dev/null || true
+    /etc/init.d/jio-wan-led start
 fi
 
 # --- 9. Sysupgrade Persistence & Flash Sync ---
@@ -605,10 +1154,11 @@ log "Restarting odhcpd, dnsmasq, and firewall (SSH stays connected)..."
 
 # --- 11. Pre-Restart Verification Checklist (100% written to flash!) ---
 log "=== All Files & Configs Committed to Flash ==="
-log "  wan6: device=$(uci -q get network.wan6.device) | iface_464xlat=$(uci -q get network.wan6.iface_464xlat)"
+log "  wan6: device=$(uci -q get network.wan6.device) | reqaddress=$(uci -q get network.wan6.reqaddress) | clientid=$(uci -q get network.wan6.clientid || echo auto) | iface_464xlat=$(uci -q get network.wan6.iface_464xlat)"
+log "  dhcp IPv6: mode=$EFFECTIVE_IPV6_MODE | wan6_master=$(uci -q get dhcp.wan6.master || echo 0) | lan_ra=$(uci -q get dhcp.lan.ra) | lan_ndp=$(uci -q get dhcp.lan.ndp || echo disabled)"
+log "  DNS (WAN+LAN): IPv4=$DNS_V4_LIST | IPv6=$DNS_V6_LIST"
 log "  clat: proto=$(uci -q get network.clat.proto) | ip6prefix=$(uci -q get network.clat.ip6prefix) | mtu=$(uci -q get network.clat.mtu)"
-log "  wan_dev: macaddr=$(uci -q get network.wan_dev.macaddr || echo factory) | promisc=$(uci -q get network.wan_dev.promisc)"
-log "  firewall: flow_offloading=$(uci -q get firewall.@defaults[0].flow_offloading) | mss_clamp=$(nft list chain inet fw4 clat_mss_clamp >/dev/null 2>&1 && echo OK || echo PENDING)"
+log "  firewall: flow_offloading=$(uci -q get firewall.@defaults[0].flow_offloading) | allow_clat=OK | mss_clamp=$(nft list chain inet fw4 clat_mss_clamp >/dev/null 2>&1 && echo OK || echo PENDING)"
 log "  dhcpv6.sh perms: $(ls -l /lib/netifd/proto/dhcpv6.sh | awk '{print $1}')"
 log "  setup log: $LOG_FILE"
 
@@ -617,7 +1167,7 @@ if uci -q get network.wwan >/dev/null 2>&1; then
 fi
 
 if [ -d "$BACKUP_DIR" ]; then
-    log "Rollback stock Official odhcp6c anytime: $SCRIPT_DIR/apply-mt7986-odhcp6c.sh --rollback"
+    log "Rollback stock Official odhcp6c anytime: wget -4 -qO- $REPO_RAW_BASE/scripts/apply-mt7986-odhcp6c.sh | sh -s -- --rollback"
 fi
 
 # --- 12. Detached Background netifd Restart (Prevents SSH Disconnect From Killing Script) ---
@@ -648,7 +1198,7 @@ log "After reconnecting, check: cat $RESTART_LOG"
             ELAPSED=0
             while [ "$ELAPSED" -lt 60 ]; do
                 if ip link show dev 464-clat >/dev/null 2>&1 && \
-                   ifstatus wan6 2>/dev/null | grep -q '"up": true'; then
+                   ifstatus wan6 2>/dev/null | grep -q '"address": "2409:'; then
                     break
                 fi
                 sleep 3
@@ -661,8 +1211,8 @@ log "After reconnecting, check: cat $RESTART_LOG"
             fi
 
             echo "[$(date)] === Post-Restart Status ==="
-            ifstatus wan6 2>/dev/null | grep -E '"up"|"proto"|"device"|"address"' || true
-            ip link show dev 464-clat 2>/dev/null | grep -o 'mtu [0-9]*' || echo "464-clat: waiting for Jio RA"
+            ifstatus wan6 2>/dev/null | grep -E '"up"|"proto"|"device"|"address"|"target"' || true
+            ip link show dev 464-clat 2>/dev/null | grep -o 'mtu [0-9]*' || echo "464-clat: waiting for Jio IPv6"
             ip route show dev 464-clat 2>/dev/null || true
         else
             echo "[$(date)] WAN cable not connected yet. Plug in Jio 5G ODU and reboot."

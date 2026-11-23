@@ -1,19 +1,19 @@
 <div align="center">
 
-# Jio AirFiber 5G WAN for OpenWrt - 6J01
+# Jio AirFiber 5G WAN for OpenWrt
 
-**Production-tested SLAAC IPv6 + 464XLAT (`kmod-nat46`) automation toolkit for Jio AirFiber 5G ODUs on OpenWrt**
+**Zero-touch dual-stack IPv6 (Auto-VLAN / Untagged SLAAC / DHCPv6-PD) + 464XLAT (`kmod-nat46`) toolkit for Jio AirFiber 5G ODUs on OpenWrt**
 
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-25.12.x%20%7C%20Snapshot-00B5E2?style=for-the-badge&logo=openwrt&logoColor=white)](https://openwrt.org/)
 [![Target](https://img.shields.io/badge/Target-MediaTek%20Filogic%20MT7986-2B3137?style=for-the-badge)](https://openwrt.org/docs/techref/hardware/soc/soc.mediatek)
-[![Protocol](https://img.shields.io/badge/Stack-IPv6%20SLAAC%20%2B%20464XLAT-10B981?style=for-the-badge)](#why-this-toolkit)
+[![Protocol](https://img.shields.io/badge/Stack-IPv6%20%2B%20464XLAT-10B981?style=for-the-badge)](#why-this-toolkit)
 [![License](https://img.shields.io/badge/License-Personal%20Non--Commercial-E11D48?style=for-the-badge)](LICENSE)
 [![YouTube](https://img.shields.io/badge/YouTube-The%20DIY%20Daddy-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/@the_diy_daddy)
 
 [Quick Start](#quick-start) •
-[Firmware Build](#step-1-build-custom-firmware) •
+[One-Line Setup](#step-4-run-the-one-line-setup-script) •
 [CLI Reference](#cli-options) •
-[Verification](#step-6-switch-to-jio-5g-wan--verify) •
+[Verification](#step-5-switch-to-jio-5g-wan--verify) •
 [Technical Report](docs/TECHNICAL_ANALYSIS.md) •
 [Credits](CREDITS.md)
 
@@ -23,16 +23,16 @@
 
 ## Why This Toolkit?
 
-Standard OpenWrt installs hit four separate failures on Jio AirFiber 5G links: **NAT64 TCP stalls**, **`odhcpd` `allmulticast` flapping**, **duplicate `464-wan6_4` interfaces**, and an **`odhcp6c` regression on Official OpenWrt 25.12.6**. This toolkit automates the empirically verified fix end-to-end without touching your AP Wi-Fi settings.
+Different Jio AirFiber 5G ODUs use completely different WAN handshakes — some send **untagged SLAAC `/64`**, while others require **802.1Q VLAN `1015` (or custom VLANs) with stateful DHCPv6 `IA_NA` + `IA_PD` and MAC-based DUID-LL**. Standard OpenWrt installs also hit **NAT64 TCP stalls**, **missing LAN IPv6**, **BNG `UnspecFail` rejections**, and an **`odhcp6c` regression on Official OpenWrt 25.12.6**.
 
 | Feature | What It Solves |
 | :--- | :--- |
+| **Direct One-Liner + Auto Package Install** | Pipe directly from GitHub (`wget -4 -qO- ... \| sh -s -- ...`) — no `/tmp` tarball extraction required. Automatically installs `464xlat`, `kmod-nat46`, `ip-tiny`, `luci-proto-ipv6` (and `tcpdump-mini` for `--auto`) via `apk`/`opkg`. |
+| **Auto VLAN Detection (`--auto`) & Custom `--vlan <ID>`** | Sniffs and probes your live Jio ODU on `wan`, filters out internal management VLANs (e.g. `2405:200:... /118`), and automatically configures **untagged `wan`**, **VLAN `1015`**, **VLAN `960`**, or any custom 802.1Q VLAN ID. |
+| **VLAN DHCPv6-PD (`UnspecFail`) Fix** | Automatically sets `reqaddress='force'`, deterministic MAC-based DUID-LL (`00030001<mac>`), clean `802.1Q` `mtu='1500'` (no `promisc`), `Allow-464XLAT` firewall rule, `lan.ip6assign='64'`, and native `odhcpd` `server` mode for delegated `/64` prefixes. |
+| **Untagged SLAAC + IPv6 Relay** | On untagged SLAAC-only ODUs, automatically configures `wan_dev` (`promisc='1'`) and `odhcpd` IPv6 relay (`wan6` master → `lan`) so LAN devices receive global `2409:...` IPv6 addresses. |
 | **Zero-Drop Split-MTU Engine (`1280 / 1260 / 1220`)** | Sets `464-clat` device MTU to `1280`, IPv4 route MTU to `1260` (`advmss 1220`), and `fw4` forward-chain TCP MSS clamping to `1220` — cutting 10 MB IPv4 downloads from **19s → 3s** with **0 drops**. |
-| **Auto Official 25.12.x `mt7986` `odhcp6c` Fix** | Automatically backs up stock files to `/root/odhcp6c-25.12.6-backup/`, atomically installs the working `aarch64` `odhcp6c`, `dhcpv6.sh`, and `dhcpv6.script` (`chmod 0755`), verifies protocol registration, and skips itself on Snapshots. |
-| **Clean 464XLAT + Private DNS** | Locks `wan6.iface_464xlat='0'` and `clat.ip6prefix='64:ff9b::/96'` so a single `464-clat` interface starts cleanly while enforcing Cloudflare & Google IPv4/IPv6 DNS (`noresolv='1'`, `peerdns='0'`). |
-| **Zero `allmulticast` Flapping & Safe Offload** | Disables conflicting `odhcpd` NDP relay on `wan`, disables `flow_offloading` (prevents MediaTek PPE / `kmod-nat46` stalls), and enables `packet_steering='1'`. |
-| **SSH-Safe Execution & Rollback** | Ignores `SIGHUP`, commits and `sync`s 100% of configs to flash before triggering a detached background `netifd` restart (or skip restart completely with `--no-restart`). |
-| **WAN Status LED Daemon & Sysupgrade Safe** | Optional `procd` LED monitor (`jio-wan-led`) showing live IPv6/IPv4 health (never touches Wi-Fi LEDs), with all hooks and binaries registered in `/etc/sysupgrade.conf`. |
+| **Google + Cloudflare DNS (WAN & LAN) + Auto 25.12.x `odhcp6c` Fix** | Applies Google (`8.8.8.8` / `2001:4860:4860::8888`) & Cloudflare (`1.1.1.1` / `2606:4700:4700::1111`) IPv4/IPv6 DNS across WAN, `dnsmasq`, and LAN; atomically installs the verified `mt7986` `odhcp6c` bundle (`0755`) on Official 25.12.x with rollback backup. |
 
 ---
 
@@ -42,170 +42,100 @@ Standard OpenWrt installs hit four separate failures on Jio AirFiber 5G links: *
 | :--- | :---: | :---: |
 | **IPv4 over 464XLAT (`464-clat`)** | `19s` (TCP stalls & retransmissions) | **`3s`** (`13,589` pkts · **`0` errors · `0` drops**) |
 | **Native IPv6 (`wan6`)** | `3s` | **`3–4s`** (`0%` packet loss) |
-| **NAT64 / `allmulticast` Kernel Flaps** | Every ~100 ms (with `ndp='relay'`) | **`0`** |
+| **LAN Global IPv6 (`2409:...`)** | ULA-only (`fd...`) or `UnspecFail` | **Full dual-stack (Auto `relay` or `IA_PD` `server`)** |
 
 > [!NOTE]
-> Deep-dive packet analysis, kernel log traces, and architectural benchmarks are documented in **[`docs/TECHNICAL_ANALYSIS.md`](docs/TECHNICAL_ANALYSIS.md)**.
+> Packet-level root cause analysis (including the VLAN `1015` `UnspecFail` / DUID-LL trace and split-MTU benchmarks) is documented in **[`docs/TECHNICAL_ANALYSIS.md`](docs/TECHNICAL_ANALYSIS.md)**.
 
 ---
 
 ## Quick Start
 
-### Step 1: Build Custom Firmware
+### Step 1: Flash OpenWrt (Stock Official or Custom Build)
 
-Open **[OpenWrt Firmware Selector](https://firmware-selector.openwrt.org/)**, pick your router model and OpenWrt version (**25.12.x Official** or **SNAPSHOT**), expand **Customize installed packages and/or first boot script**, and append these packages:
+Flash **OpenWrt Official 25.12.x** or **SNAPSHOT** on your router. Because the setup script automatically downloads and installs missing packages via `apk`/`opkg` over temporary Wi-Fi (`wwan`), you can use a standard Official image — or optionally pre-bundle these packages in **[OpenWrt Firmware Selector](https://firmware-selector.openwrt.org/)**:
 
 ```text
 luci 464xlat kmod-nat46 ip-tiny luci-proto-ipv6 ca-bundle
 ```
 
 <details>
-<summary><strong>Why each package is required</strong> (click to expand)</summary>
+<summary><strong>Optional: First-Boot Wi-Fi Script (<code>uci-defaults</code>) & Package Details</strong> (click to expand)</summary>
 
 | Package | Role |
 | :--- | :--- |
 | `464xlat` | Userspace CLAT daemon translating IPv4 traffic over Jio's IPv6-only 5G link (`64:ff9b::/96`). |
 | `kmod-nat46` | Kernel module providing stateless IPv4 ↔ IPv6 translation (`464-clat` interface). |
-| `ip-tiny` | Full `iproute2` binary required for `mtu` and `advmss` route flags (BusyBox `ip` ignores them). |
+| `ip-tiny` | Full `iproute2` binary required for `mtu` and `advmss` route flags. |
 | `luci-proto-ipv6` | LuCI web UI support for DHCPv6/SLAAC and IPv6 interfaces. |
-| `luci` | Web interface (required on Snapshot builds; safe to include on Official builds). |
-| `ca-bundle` | TLS root certificates for HTTPS downloads from GitHub and `api.ipify.org`. |
+| `tcpdump-mini` | Installed automatically on-demand when using `--auto` VLAN detection. |
 
-*(Optional: append `luci-ssl` if you want HTTPS access to LuCI.)*
+Paste [`scripts/uci-defaults-wifi.sh`](scripts/uci-defaults-wifi.sh) into **Script to run on first boot (uci-defaults)** in Firmware Selector if you want 2.4 GHz & 5 GHz Wi-Fi (`OpenWrt-Jio5G` / `12345678`) enabled immediately after flashing.
 
 </details>
 
 ---
 
-### Step 2: Enable First-Boot Wi-Fi (`uci-defaults`)
+### Step 2: Connect Temporary Internet (`wwan`) & Plug In Jio ODU
 
-OpenWrt ships with Wi-Fi disabled after a fresh flash. Paste [`scripts/uci-defaults-wifi.sh`](scripts/uci-defaults-wifi.sh) into **Script to run on first boot (uci-defaults)** before clicking **Request Build**. It brings up 2.4 GHz & 5 GHz Wi-Fi (`OpenWrt-Jio5G` / `12345678`) with the MT76 `multicast_to_unicast='0'` DHCP fix.
+1. Open LuCI at `http://192.168.1.1`, go to **Network → Wireless**, click **Scan**, and join your phone hotspot or existing Wi-Fi as a **Client** (`wwan`) in the `wan` firewall zone.
+2. Plug the **Jio AirFiber 5G ODU** Ethernet cable into your router's **WAN** port *(required if using `--auto` VLAN detection)*.
 
-<details>
-<summary><strong>View <code>scripts/uci-defaults-wifi.sh</code></strong> (click to expand & copy)</summary>
+---
+
+### Step 3: Connect Over SSH
 
 ```sh
-#!/bin/sh
-# Jio Airfiber 5G WAN For OpenWrt — First-Boot Wi-Fi Setup (uci-defaults)
-# Enables 2.4GHz & 5GHz Wi-Fi on boot with MT76 DHCP fix
-
-WIFI_SSID="OpenWrt-Jio5G"
-WIFI_KEY="12345678"
-
-[ ! -f /etc/config/wireless ] && /sbin/wifi config 2>/dev/null || true
-
-if [ -f /etc/config/wireless ]; then
-    for radio in $(uci show wireless | grep "=wifi-device" | cut -d'.' -f2 | cut -d'=' -f1); do
-        BAND=$(uci -q get wireless."$radio".band || echo "")
-        HWMODE=$(uci -q get wireless."$radio".hwmode || echo "")
-        uci set wireless."$radio".country='IN'
-        uci set wireless."$radio".disabled='0'
-        if [ "$BAND" = "5g" ] || echo "$HWMODE" | grep -q "11a"; then
-            uci set wireless."$radio".htmode='HE80'
-            uci set wireless."$radio".channel='36'
-        else
-            uci set wireless."$radio".htmode='HT20'
-            uci set wireless."$radio".channel='auto'
-        fi
-    done
-
-    for iface in $(uci show wireless | grep "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
-        uci set wireless."$iface".disabled='0'
-        uci set wireless."$iface".network='lan'
-        uci set wireless."$iface".ssid="$WIFI_SSID"
-        uci set wireless."$iface".encryption='psk2'
-        uci set wireless."$iface".key="$WIFI_KEY"
-        uci set wireless."$iface".multicast_to_unicast='0'
-    done
-
-    uci commit wireless
-fi
-
-exit 0
+ssh root@192.168.1.1
 ```
-
-</details>
 
 ---
 
-### Step 3: Temporarily Connect to an External Wi-Fi Hotspot (`wwan`)
+### Step 4: Run the One-Line Setup Script
+
+Pick **one** command below — it runs directly from GitHub, installs any missing packages (`464xlat`, `kmod-nat46`, `ip-tiny`, `luci-proto-ipv6`, and `tcpdump-mini` for `--auto`), applies the Official 25.12.x `mt7986` `odhcp6c` fix automatically, and configures everything in one shot *(replace the MAC with your paired Jio router's WAN MAC, or omit `--mac` to keep factory MAC)*:
+
+#### Option A — Recommended: Auto-Detect VLAN / Untagged (`--auto`)
+Automatically detects whether your Jio ODU uses untagged `wan`, VLAN `1015`, or another VLAN ID (while ignoring internal management VLANs like `960`), and configures the matching IPv6 stack (`relay` vs `IA_PD` `server`):
+
+```sh
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --auto --mac "AC:10:07:27:C0:D2" --led -y
+```
+
+#### Option B — Untagged `wan` (SLAAC `/64` + IPv6 Relay)
+
+```sh
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --untagged --mac "00:1A:79:b6:56:6c" --led -y
+```
+
+#### Option C — VLAN `1015` (Stateful DHCPv6 `IA_NA` + `IA_PD` + MAC DUID-LL)
+
+```sh
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --vlan 1015 --mac "AC:10:07:27:C0:D2" --led -y
+```
+
+#### Option D — VLAN `960` or Any Custom VLAN ID
+
+```sh
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --vlan 960 --mac "AC:10:07:27:C0:D2" --led -y
+```
 
 > [!TIP]
-> On a freshly flashed router without Jio 5G internet yet, give the router temporary internet via your phone hotspot or existing Wi-Fi so it can fetch the toolkit cleanly into `/tmp`.
-
-1. Flash your custom `sysupgrade.bin`, connect to `OpenWrt-Jio5G` (password `12345678`), and open LuCI at `http://192.168.1.1`.
-2. Go to **Network → Wireless**, click **Scan** on either radio, and join your external Wi-Fi as a **Client** (`wwan`) assigned to the `wan` firewall zone.
-3. Connect over SSH:
-   ```sh
-   ssh root@192.168.1.1
-   ```
+> Add `--no-restart` to any command above if you want your SSH/LuCI session to stay connected while you remove temporary `wwan` and reboot manually.
 
 ---
 
-### Step 4: Download the Toolkit Once into `/tmp`
+### Step 5: Switch to Jio 5G WAN & Verify
 
-Run this single command to download and extract all scripts and `mt7986` `odhcp6c` files into `/tmp/jio-airfiber-5g-wan`:
-
-```sh
-rm -rf /tmp/Jio-Airfiber-5G-WAN-For-OpenWrt-main /tmp/jio-airfiber-5g-wan /tmp/jio5g.tar.gz && \
-wget -4 -O /tmp/jio5g.tar.gz https://codeload.github.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/tar.gz/refs/heads/main && \
-tar -xzf /tmp/jio5g.tar.gz -C /tmp && \
-mv /tmp/Jio-Airfiber-5G-WAN-For-OpenWrt-main /tmp/jio-airfiber-5g-wan && \
-chmod +x /tmp/jio-airfiber-5g-wan/scripts/*.sh
-```
-
-> [!NOTE]
-> Using `wget -4` with `codeload.github.com` bypasses Jio DNS64 (`64:ff9b::`) hangs and `github.com` redirect timeouts on fresh flashes.
-
----
-
-### Step 5: Run the Setup Script
-
-Pick **one** command below that matches your setup *(replace the MAC address with your Jio router's WAN MAC, or omit `--mac` to keep your factory MAC)*:
-
-#### Option A — Recommended: Untagged `wan` (One-Command Non-Interactive)
-Works for most Jio AirFiber 5G ODUs & bridge-mode setups. Automatically applies the Official 25.12.x `mt7986` `odhcp6c` fix, configures `wan6` + `clat` + split-MTU + `fw4` MSS clamping, and installs the WAN LED monitor:
-
-```sh
-/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:AA:11:BB:22:CC" --led -y
-```
-
-#### Option B — Installing Over Temporary `wwan` (No SSH Drop Until You Reboot)
-Same as Option A, but skips the immediate `netifd` restart so your SSH/LuCI session stays up while you remove `wwan` and plug in the Jio ODU:
-
-```sh
-/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --untagged --mac "00:AA:11:BB:22:CC" --led --no-restart -y
-```
-
-#### Option C — VLAN `1015` Mode (`wan.1015`)
-Use **only** if your specific Jio AirFiber ODU requires 802.1Q VLAN `1015` tagging on the Ethernet port:
-
-```sh
-/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --vlan1015 --mac "00:AA:11:BB:22:CC" --led -y
-```
-
-#### Option D — Interactive Mode (Guided Prompts)
-
-```sh
-/tmp/jio-airfiber-5g-wan/scripts/jio-airfiber-5g-wan.sh --mac "00:AA:11:BB:22:CC"
-```
-
-> [!IMPORTANT]
-> You **do not** need to run `apply-mt7986-odhcp6c.sh` separately — `jio-airfiber-5g-wan.sh` detects Official 25.12.x on `aarch64` and applies the `files/` patch automatically.
-
----
-
-### Step 6: Switch to Jio 5G WAN & Verify
-
-1. In LuCI (**Network → Wireless** and **Network → Interfaces**), delete or disable your temporary `wwan` Wi-Fi client so all IPv4 traffic routes through Jio `464-clat`.
-2. Plug the Jio AirFiber 5G ODU Ethernet cable into the router's **WAN** port and reboot:
+1. In LuCI (**Network → Wireless** and **Network → Interfaces**), disable or remove your temporary `wwan` Wi-Fi client so all IPv4 traffic routes over Jio `464-clat`.
+2. Reboot the router:
    ```sh
    reboot
    ```
-3. Wait **1–2 minutes** for the first Jio Router Advertisement, then verify via SSH:
+3. Wait **1–2 minutes** for the Jio IPv6 handshake, then verify via SSH:
 
 ```sh
-ifstatus wan6 | grep -E '"up"|"proto"|"device"|"address"'
+ifstatus wan6 | grep -E '"up"|"proto"|"device"|"address"|"target"'
 ip link show dev 464-clat | grep -o 'mtu [0-9]*'
 ip route show dev 464-clat
 nft list chain inet fw4 clat_mss_clamp
@@ -218,14 +148,14 @@ wget -4 -qO- -T 5 https://api.ipify.org && echo ""
 ```text
 "up": true,
 "proto": "dhcpv6",
-"device": "wan",
+"device": "wan.1015",   # or "wan" on untagged ODUs
 "address": "2409:xxxx:xxxx:xxxx::xxxx",
 mtu 1280
 default scope link metric 2048 mtu 1260 advmss 1220
 ... maxseg size set 1220
 2 packets transmitted, 2 packets received, 0% packet loss
 2 packets transmitted, 2 packets received, 0% packet loss
-152.58.xxx.xxx
+49.36.xxx.xxx
 ```
 
 ---
@@ -237,24 +167,23 @@ default scope link metric 2048 mtu 1260 advmss 1220
 
 | Flag | Description |
 | :--- | :--- |
-| `--untagged` | Use untagged `wan` device (**recommended default**). |
-| `--vlan1015` | Create and use `802.1Q` VLAN `1015` (`wan.1015`). |
-| `--mac "<MAC>"` | Clone a specific WAN MAC address (e.g., `"00:1A:79:b6:56:6c"`). |
+| `--auto` | Auto-detect untagged vs VLAN ID on live `wan` link (installs `tcpdump-mini` if missing). |
+| `--untagged` | Force untagged `wan` mode (SLAAC `/64` + IPv6 relay). |
+| `--vlan <ID>` | Force any 802.1Q VLAN ID (`1`–`4094`), e.g. `--vlan 1015` or `--vlan 960`. |
+| `--vlan1015` / `--vlan960` | Shorthands for `--vlan 1015` and `--vlan 960`. |
+| `--mac "<MAC>"` | Clone a paired WAN MAC address (also auto-generates DUID-LL `00030001<mac>` in VLAN mode). |
+| `--clientid "<HEX>"` | Override the DHCPv6 Client-ID / DUID manually. |
+| `--ipv6-mode <mode>` | `auto` (default: `relay` for untagged, `server` for VLAN `IA_PD`), `relay`, or `server`. |
 | `--nat64-prefix "<CIDR>"` | Override Jio NAT64 IPv6 prefix (default: `64:ff9b::/96`). |
 | `--led` / `--no-led` | Enable (default) or skip installing the `jio-wan-led` status daemon. |
 | `--odhcp6c-fix` / `--no-odhcp6c-fix` | Force or skip the Official 25.12.x `mt7986` `odhcp6c` patch (auto-detected by default). |
-| `--no-restart` | Write & commit everything to flash without triggering `network restart` (apply via `reboot`). |
+| `--no-pkg-install` | Skip automatic `apk`/`opkg` package installation (for offline custom images). |
+| `--no-restart` | Write & commit everything to flash without triggering `network restart`. |
 | `-y`, `--yes` | Non-interactive mode — accept defaults for any omitted options. |
 
 #### Standalone `mt7986` `odhcp6c` Patch & Rollback
 ```sh
-# Apply standalone (Official firmware only)
-/tmp/jio-airfiber-5g-wan/scripts/apply-mt7986-odhcp6c.sh
-```
-
-```sh
-# Restore stock Official 25.12.6 odhcp6c files from /root/odhcp6c-25.12.6-backup/
-/tmp/jio-airfiber-5g-wan/scripts/apply-mt7986-odhcp6c.sh --rollback
+wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/apply-mt7986-odhcp6c.sh | sh -s -- --rollback
 ```
 
 #### Inspect Setup & Restart Logs
@@ -268,12 +197,9 @@ cat /tmp/jio-network-restart.log
 <details>
 <summary><strong>Quick Troubleshooting</strong> (click to expand)</summary>
 
-- **`wan6` stays `"up": false` after reboot:** Check whether your ODU expects untagged `wan` vs VLAN `1015`. Switch instantly with:
-  ```sh
-  uci set network.wan6.device='wan' && uci -q delete network.wan_1015 || true && uci commit network && /etc/init.d/network reload
-  ```
-- **First connection takes 1–2 minutes:** Jio 5G ODUs send periodic Router Advertisements; wait up to 120 seconds after plugging in the WAN cable or rebooting before assuming a failure.
-- **IPv4 still routing via phone hotspot:** Make sure you deleted or disabled your temporary `wwan` interface in LuCI (`ip -4 route` should show only `464-clat` as the default route).
+- **VLAN `1015` gets `"up": true` with DNS `2405:200:800::3` but no `2409:...` IP:** Make sure you passed your paired Jio router's exact WAN MAC via `--mac` (so the script generates `clientid='00030001<mac>'` and `reqaddress='force'`), and power-cycle the ODU for 60 seconds if you just unplugged the stock Jio router.
+- **Note on VLAN `960`:** On many Jio ODUs, VLAN `960` is Jio's internal management/ACS VLAN (`2405:200:.../118`) rather than internet. `--auto` automatically skips `2405:200:.../118` management VLANs; only use `--vlan 960` if your specific ODU actually serves internet on VLAN 960.
+- **IPv4 still routing via phone hotspot:** Delete or disable `wwan` in LuCI (`ip -4 route` should show only `464-clat` as the default route).
 
 </details>
 
@@ -283,7 +209,7 @@ cat /tmp/jio-network-restart.log
 
 ```text
 Jio-Airfiber-5G-WAN-For-OpenWrt/
-├── README.md                           # Main guide & quick start
+├── README.md                           # Main guide & direct one-line setup
 ├── LICENSE                             # Personal, non-commercial license & video terms
 ├── CREDITS.md                          # Acknowledgments & contributors
 ├── .gitattributes                      # Enforces Unix LF scripts & binary odhcp6c
@@ -294,7 +220,7 @@ Jio-Airfiber-5G-WAN-For-OpenWrt/
 │   ├── dhcpv6.sh                       # netifd dhcpv6 protocol handler
 │   └── dhcpv6.script                   # odhcp6c state hook script
 └── scripts/
-    ├── jio-airfiber-5g-wan.sh          # Universal all-in-one setup script
+    ├── jio-airfiber-5g-wan.sh          # Universal all-in-one setup + auto-VLAN + auto-pkg script
     ├── apply-mt7986-odhcp6c.sh         # Standalone Official 25.12.x odhcp6c fix & rollback
     ├── jio-wan-led.sh                  # Standalone WAN/464XLAT LED status monitor
     └── uci-defaults-wifi.sh            # First-boot Wi-Fi enable script (Firmware Selector)
