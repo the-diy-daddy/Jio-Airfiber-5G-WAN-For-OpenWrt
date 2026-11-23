@@ -3,25 +3,29 @@
 # Jio Airfiber 5G WAN For OpenWrt (Official 25.12.x & Snapshot)
 # Author: The DIY Daddy (https://github.com/the-diy-daddy)
 #
-# Direct one-liner usage (no /tmp download required):
-#   wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --auto --mac "AC:10:07:27:C0:D2" --led -y
+# Direct zero-touch one-liner (no /tmp extraction required):
+#   wget -4 -qO- https://raw.githubusercontent.com/the-diy-daddy/Jio-Airfiber-5G-WAN-For-OpenWrt/main/scripts/jio-airfiber-5g-wan.sh | sh -s -- --mac "AC:10:07:27:C0:D2" -y
 #
-# Key guarantees:
+# Fully automatic end-to-end checklist:
 # - Runs directly via `wget -4 -qO- ... | sh -s -- ...` OR from a local clone.
 # - Automatically installs missing packages via apk/opkg (464xlat, kmod-nat46,
 #   ip-tiny, luci-proto-ipv6, plus tcpdump-mini when --auto VLAN detection runs).
-# - Supports automatic ODU VLAN detection (--auto), untagged SLAAC (--untagged),
-#   VLAN 1015 (--vlan1015 / --vlan 1015), VLAN 960 (--vlan960 / --vlan 960), or
-#   any custom 802.1Q VLAN ID (--vlan <ID>).
-# - For VLAN-tagged ODUs (DHCPv6 IA_NA + IA_PD): configures clean 802.1Q device
-#   (no promisc, mtu 1500), reqaddress='force', MAC-based DUID-LL clientid
-#   (00030001<mac>) to prevent BNG UnspecFail, lan.ip6assign='64', Allow-464XLAT
-#   firewall rule, and odhcpd server mode.
-# - For untagged ODUs (SLAAC-only /64): configures wan_dev (promisc='1') and
-#   odhcpd IPv6 relay (wan6 master -> lan) so LAN devices receive global 2409:: IPs.
-# - Enforces 1280/1260/1220 split-MTU + fw4 MSS clamping, Google + Cloudflare
-#   IPv4/IPv6 DNS on WAN, dnsmasq, and LAN, atomic 0755 mt7986 odhcp6c fix on
-#   Official 25.12.x, and detached SSH-safe netifd restart.
+# - Automatically patches Official 25.12.x mt7986 (aarch64) odhcp6c atomically
+#   (0755, backup in /root/odhcp6c-25.12.6-backup, rollback supported).
+# - Automatically detects untagged SLAAC vs 802.1Q VLAN (1015, custom VLANs)
+#   while filtering out Jio management-only VLANs (e.g. VLAN 960 2405:200:.../118).
+# - VLAN ODUs (stateful DHCPv6 IA_NA + IA_PD): configures clean 802.1Q wan.<ID>
+#   (mtu 1500, no promisc), reqaddress='force', MAC-based DUID-LL clientid
+#   (00030001<mac>) to prevent BNG UnspecFail, lan.ip6assign='64', odhcpd server
+#   mode, and installs /etc/hotplug.d/iface/98-clat-iapd so network.clat.ip6addr
+#   dynamically tracks Jio's live IA_PD /64 prefix across reboots & rotations.
+# - Untagged ODUs (SLAAC-only /64): configures wan_dev (promisc='1') and odhcpd
+#   IPv6 relay (wan6 master -> lan) so LAN devices receive global 2409:: IPs.
+# - Both modes: installs 1280/1260/1220 split-MTU hotplug (99-clat-mtu), fw4
+#   MSS clamping (99-clat-mss.nft), Allow-464XLAT firewall rule, disables
+#   flow_offloading, enables packet_steering, sets Google + Cloudflare IPv4/IPv6
+#   DNS across WAN, dnsmasq, and LAN, registers everything in /etc/sysupgrade.conf,
+#   and runs an SSH-safe detached netifd restart + live self-check.
 # ==============================================================================
 
 set -eu
@@ -42,7 +46,7 @@ LOG_FILE="/tmp/jio-5g-setup.log"
 RESTART_LOG="/tmp/jio-network-restart.log"
 
 # --- Configurable Defaults (override via CLI flags, env vars, or prompts) ---
-WAN_MODE="${WAN_MODE:-}"                   # "auto", "untagged", or "vlan"
+WAN_MODE="${WAN_MODE:-}"                   # "auto" (default), "untagged", or "vlan"
 WAN_VLAN_ID="${WAN_VLAN_ID:-}"             # e.g., "1015", "960", or any 1..4094
 WAN_MAC="${WAN_MAC:-}"                     # e.g., "AC:10:07:27:C0:D2"
 WAN_CLIENTID="${WAN_CLIENTID:-}"           # optional custom DHCPv6 DUID hex
@@ -195,9 +199,11 @@ probe_vlan_id() {
 
     own_ll="$(ip -6 addr show dev "$dev" scope link 2>/dev/null | awk '/inet6 fe80/{sub(/\/.*/,"",$2); print tolower($2); exit}' || true)"
 
-    tcpdump -i wan -e -nn -vv -l "vlan ${vid} and (icmp6 or port 546 or port 547)" >"$cap" 2>/dev/null &
-    tpid=$!
-    sleep 1
+    if command -v tcpdump >/dev/null 2>&1; then
+        tcpdump -i wan -e -nn -vv -l "vlan ${vid} and (icmp6 or port 546 or port 547)" >"$cap" 2>/dev/null &
+        tpid=$!
+        sleep 1
+    fi
 
     ping -6 -I "$dev" -c 2 -W 2 ff02::2 >"$ping_out" 2>&1 || true
 
@@ -215,17 +221,19 @@ probe_vlan_id() {
         sleep 4
     fi
 
-    kill "$tpid" 2>/dev/null || true
-    wait "$tpid" 2>/dev/null || true
+    if [ -n "$tpid" ]; then
+        kill "$tpid" 2>/dev/null || true
+        wait "$tpid" 2>/dev/null || true
+    fi
 
     # Classify captured traffic on this VLAN:
     # 3 = Confirmed Jio 5G global 2409: prefix in RA or DHCPv6
     # 2 = Confirmed foreign IPv6 router / DHCPv6 server (excluding 2405:200:.../118 management-only)
     # 1 = Management/ACS VLAN only (e.g., VLAN 960 advertising 2405:200:... /118)
     # 0 = No foreign IPv6 response
-    if grep -qiE '2409:[0-9a-f:]+' "$cap" 2>/dev/null; then
+    if [ -f "$cap" ] && grep -qiE '2409:[0-9a-f:]+' "$cap" 2>/dev/null; then
         score=3
-    elif grep -qiE '2405:200:[0-9a-f:]+/118' "$cap" 2>/dev/null; then
+    elif [ -f "$cap" ] && grep -qiE '2405:200:[0-9a-f:]+/118' "$cap" 2>/dev/null; then
         score=1
     else
         local foreign_ping=0
@@ -237,7 +245,7 @@ probe_vlan_id() {
             foreign_ping=1
         fi
 
-        if [ "$foreign_ping" -eq 1 ] || grep -qiE 'dhcp6 (advertise|reply)|router advertisement' "$cap" 2>/dev/null; then
+        if [ "$foreign_ping" -eq 1 ] || { [ -f "$cap" ] && grep -qiE 'dhcp6 (advertise|reply)|router advertisement' "$cap" 2>/dev/null; }; then
             score=2
         fi
     fi
@@ -250,27 +258,54 @@ probe_vlan_id() {
 }
 
 probe_untagged_wan() {
+    local probe_mac="$1"
     local cap="/tmp/jio-probe-untagged-$$.log"
     local ping_out="/tmp/jio-ping-untagged-$$.log"
     local own_ll=""
     local tpid=""
+    local opid=""
     local score=0
 
     if ip -6 addr show dev wan 2>/dev/null | grep -qi '2409:'; then
         echo 3
         return 0
     fi
+
+    if [ -n "$probe_mac" ]; then
+        local cur_mac
+        cur_mac="$(cat /sys/class/net/wan/address 2>/dev/null | tr 'A-F' 'a-f' || true)"
+        if [ "$cur_mac" != "$(printf '%s' "$probe_mac" | tr 'A-F' 'a-f')" ]; then
+            ip link set dev wan address "$probe_mac" 2>/dev/null || true
+            sleep 2
+        fi
+    fi
+
     own_ll="$(ip -6 addr show dev wan scope link 2>/dev/null | awk '/inet6 fe80/{sub(/\/.*/,"",$2); print tolower($2); exit}' || true)"
 
-    tcpdump -i wan -e -nn -vv -l 'not vlan and (icmp6 or port 546 or port 547)' >"$cap" 2>/dev/null &
-    tpid=$!
-    sleep 1
-    ping -6 -I wan -c 3 -W 2 ff02::2 >"$ping_out" 2>&1 || true
-    sleep 5
-    kill "$tpid" 2>/dev/null || true
-    wait "$tpid" 2>/dev/null || true
+    if command -v tcpdump >/dev/null 2>&1; then
+        tcpdump -i wan -e -nn -vv -l 'not vlan and (icmp6 or port 546 or port 547)' >"$cap" 2>/dev/null &
+        tpid=$!
+        sleep 1
+    fi
 
-    if grep -qiE '2409:[0-9a-f:]+' "$cap" 2>/dev/null; then
+    ping -6 -I wan -c 2 -W 2 ff02::2 >"$ping_out" 2>&1 || true
+
+    if command -v odhcp6c >/dev/null 2>&1; then
+        odhcp6c -s /bin/true -Ntry -P0 -t10 wan >/dev/null 2>&1 &
+        opid=$!
+        sleep 6
+        kill "$opid" 2>/dev/null || true
+        wait "$opid" 2>/dev/null || true
+    else
+        sleep 5
+    fi
+
+    if [ -n "$tpid" ]; then
+        kill "$tpid" 2>/dev/null || true
+        wait "$tpid" 2>/dev/null || true
+    fi
+
+    if [ -f "$cap" ] && grep -qiE '2409:[0-9a-f:]+' "$cap" 2>/dev/null; then
         score=3
     else
         local foreign_ping=0
@@ -281,7 +316,7 @@ probe_untagged_wan() {
         elif grep -qi 'bytes from fe80::' "$ping_out" 2>/dev/null; then
             foreign_ping=1
         fi
-        if [ "$foreign_ping" -eq 1 ] || grep -qiE 'router advertisement|dhcp6 (advertise|reply)' "$cap" 2>/dev/null; then
+        if [ "$foreign_ping" -eq 1 ] || { [ -f "$cap" ] && grep -qiE 'router advertisement|dhcp6 (advertise|reply)' "$cap" 2>/dev/null; }; then
             score=2
         fi
     fi
@@ -341,10 +376,8 @@ detect_jio_wan_mode() {
     log "Probe candidates: untagged + VLANs [$(printf '%s' "$candidates" | sed 's/ $//')]"
 
     local untagged_score=0
-    if command -v tcpdump >/dev/null 2>&1; then
-        untagged_score="$(probe_untagged_wan || echo 0)"
-        untagged_score="${untagged_score:-0}"
-    fi
+    untagged_score="$(probe_untagged_wan "$probe_mac" || echo 0)"
+    untagged_score="${untagged_score:-0}"
     log "  Probe untagged wan -> score=$untagged_score"
 
     local best_vlan=""
@@ -391,7 +424,7 @@ usage() {
 Usage: jio-airfiber-5g-wan.sh [OPTIONS]
 
 WAN Mode Options:
-  --auto                   Auto-detect untagged vs VLAN ID on 'wan' (installs tcpdump-mini if needed)
+  --auto                   Auto-detect untagged vs VLAN ID on 'wan' (default with -y)
   --untagged               Untagged 'wan' mode (SLAAC /64 + IPv6 relay)
   --vlan <ID>              802.1Q VLAN mode for any VLAN ID (e.g. --vlan 1015 or --vlan 960)
   --vlan1015               Shorthand for --vlan 1015 (stateful DHCPv6 IA_NA + IA_PD)
@@ -907,6 +940,7 @@ uci set network.clat.metric='10'
 uci set network.clat.peerdns='0'
 uci set network.clat.zone='wan'
 uci set network.clat.auto='1'
+# Start clean; 98-clat-iapd automatically pins ip6addr inside Jio's live IA_PD /64 when present
 uci -q delete network.clat.ip6addr || true
 uci -q delete network.clat.dns || true
 for dns in $DNS_V4_LIST; do
@@ -959,10 +993,56 @@ chain clat_mss_clamp {
 }
 EOF
 
-# --- 6. Hotplug Hook: Split MTU (1280 device / 1260 IPv4 route / 1220 advmss) ---
-log "Installing /etc/hotplug.d/iface/99-clat-mtu..."
+# --- 6. Hotplug Hooks: Dynamic IA_PD CLAT Binding + Split MTU (1280/1260/1220) ---
+log "Installing /etc/hotplug.d/iface/98-clat-iapd and /etc/hotplug.d/iface/99-clat-mtu..."
 
 mkdir -p /etc/hotplug.d/iface
+
+cat << 'EOF' > /etc/hotplug.d/iface/98-clat-iapd
+#!/bin/sh
+# Automatically binds 464-clat local.v6 inside wan6's delegated IA_PD /64 prefix
+# (prevents source-specific IPv6 routing drops on DHCPv6 IA_NA + IA_PD ODUs,
+# while staying a clean no-op on SLAAC-only ODUs that have no ipv6-prefix).
+[ "$INTERFACE" = "wan6" ] || exit 0
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ] || exit 0
+
+PD_PREFIX="$(ifstatus wan6 2>/dev/null | jsonfilter -e '@["ipv6-prefix"][0].address' 2>/dev/null || true)"
+CURRENT_IP6="$(uci -q get network.clat.ip6addr || true)"
+
+if [ -z "$PD_PREFIX" ]; then
+    # SLAAC-only link (no delegated IA_PD): clear any stale pinned ip6addr
+    if [ -n "$CURRENT_IP6" ]; then
+        uci -q delete network.clat.ip6addr || true
+        uci commit network
+        ifdown clat 2>/dev/null || true
+        sleep 1
+        ifup clat 2>/dev/null || true
+    fi
+    exit 0
+fi
+
+case "$PD_PREFIX" in
+    *::) TARGET_IP6="${PD_PREFIX}464" ;;
+    *)   TARGET_IP6="${PD_PREFIX}:464" ;;
+esac
+
+NEED_BOUNCE=0
+if [ "$CURRENT_IP6" != "$TARGET_IP6" ]; then
+    uci set network.clat.ip6addr="$TARGET_IP6"
+    uci commit network
+    NEED_BOUNCE=1
+elif ! grep -qiF "$TARGET_IP6" /proc/net/nat46/control 2>/dev/null; then
+    NEED_BOUNCE=1
+fi
+
+if [ "$NEED_BOUNCE" -eq 1 ]; then
+    ifdown clat 2>/dev/null || true
+    sleep 1
+    ifup clat 2>/dev/null || true
+fi
+EOF
+chmod 0755 /etc/hotplug.d/iface/98-clat-iapd
+
 cat << EOF > /etc/hotplug.d/iface/99-clat-mtu
 #!/bin/sh
 [ "\$INTERFACE" = "clat" ] && [ "\$ACTION" = "ifup" ] || exit 0
@@ -1068,7 +1148,7 @@ while true; do
     V6_OK=0
     V4_OK=0
     ping -6 -c 1 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && V6_OK=1
-    ping -4 -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && V4_OK=1
+    ping -4 -I 464-clat -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && V4_OK=1
 
     if [ "$V6_OK" -eq 1 ] && [ "$V4_OK" -eq 1 ]; then
         STATE="dual"
@@ -1127,6 +1207,7 @@ fi
 # --- 9. Sysupgrade Persistence & Flash Sync ---
 log "Updating /etc/sysupgrade.conf..."
 for f in \
+    /etc/hotplug.d/iface/98-clat-iapd \
     /etc/hotplug.d/iface/99-clat-mtu \
     /etc/nftables.d/99-clat-mss.nft \
     /usr/bin/jio-wan-led.sh \
@@ -1157,7 +1238,7 @@ log "=== All Files & Configs Committed to Flash ==="
 log "  wan6: device=$(uci -q get network.wan6.device) | reqaddress=$(uci -q get network.wan6.reqaddress) | clientid=$(uci -q get network.wan6.clientid || echo auto) | iface_464xlat=$(uci -q get network.wan6.iface_464xlat)"
 log "  dhcp IPv6: mode=$EFFECTIVE_IPV6_MODE | wan6_master=$(uci -q get dhcp.wan6.master || echo 0) | lan_ra=$(uci -q get dhcp.lan.ra) | lan_ndp=$(uci -q get dhcp.lan.ndp || echo disabled)"
 log "  DNS (WAN+LAN): IPv4=$DNS_V4_LIST | IPv6=$DNS_V6_LIST"
-log "  clat: proto=$(uci -q get network.clat.proto) | ip6prefix=$(uci -q get network.clat.ip6prefix) | mtu=$(uci -q get network.clat.mtu)"
+log "  clat: proto=$(uci -q get network.clat.proto) | ip6prefix=$(uci -q get network.clat.ip6prefix) | mtu=$(uci -q get network.clat.mtu) | iapd_hook=OK"
 log "  firewall: flow_offloading=$(uci -q get firewall.@defaults[0].flow_offloading) | allow_clat=OK | mss_clamp=$(nft list chain inet fw4 clat_mss_clamp >/dev/null 2>&1 && echo OK || echo PENDING)"
 log "  dhcpv6.sh perms: $(ls -l /lib/netifd/proto/dhcpv6.sh | awk '{print $1}')"
 log "  setup log: $LOG_FILE"
@@ -1170,7 +1251,7 @@ if [ -d "$BACKUP_DIR" ]; then
     log "Rollback stock Official odhcp6c anytime: wget -4 -qO- $REPO_RAW_BASE/scripts/apply-mt7986-odhcp6c.sh | sh -s -- --rollback"
 fi
 
-# --- 12. Detached Background netifd Restart (Prevents SSH Disconnect From Killing Script) ---
+# --- 12. Detached Background netifd Restart + Automatic IA_PD Sync & Self-Check ---
 if [ "$NO_RESTART" = "1" ]; then
     log "Skipped network restart (--no-restart). Run 'reboot' or '/etc/init.d/network restart' to activate."
     exit 0
@@ -1197,12 +1278,26 @@ log "After reconnecting, check: cat $RESTART_LOG"
         if [ "$WAN_CARRIER" = "1" ]; then
             ELAPSED=0
             while [ "$ELAPSED" -lt 60 ]; do
-                if ip link show dev 464-clat >/dev/null 2>&1 && \
-                   ifstatus wan6 2>/dev/null | grep -q '"address": "2409:'; then
+                if ifstatus wan6 2>/dev/null | grep -q '"address": "2409:'; then
                     break
                 fi
                 sleep 3
                 ELAPSED=$((ELAPSED + 3))
+            done
+
+            # Ensure dynamic IA_PD -> clat.ip6addr sync runs immediately once wan6 is up
+            if [ -x /etc/hotplug.d/iface/98-clat-iapd ]; then
+                INTERFACE=wan6 ACTION=ifup /etc/hotplug.d/iface/98-clat-iapd 2>/dev/null || true
+            fi
+
+            # Wait briefly for 464-clat to settle after any IA_PD sync bounce
+            CLAT_WAIT=0
+            while [ "$CLAT_WAIT" -lt 15 ]; do
+                if ip link show dev 464-clat >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 2
+                CLAT_WAIT=$((CLAT_WAIT + 2))
             done
 
             if ip link show dev 464-clat >/dev/null 2>&1; then
@@ -1212,8 +1307,12 @@ log "After reconnecting, check: cat $RESTART_LOG"
 
             echo "[$(date)] === Post-Restart Status ==="
             ifstatus wan6 2>/dev/null | grep -E '"up"|"proto"|"device"|"address"|"target"' || true
+            cat /proc/net/nat46/control 2>/dev/null || true
             ip link show dev 464-clat 2>/dev/null | grep -o 'mtu [0-9]*' || echo "464-clat: waiting for Jio IPv6"
             ip route show dev 464-clat 2>/dev/null || true
+            echo "[$(date)] === Live Connectivity Self-Check ==="
+            ping -6 -c 2 -W 3 2606:4700:4700::1111 2>&1 | tail -n 2 || true
+            ping -4 -I 464-clat -c 2 -W 3 1.1.1.1 2>&1 | tail -n 2 || true
         else
             echo "[$(date)] WAN cable not connected yet. Plug in Jio 5G ODU and reboot."
         fi

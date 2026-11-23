@@ -49,7 +49,7 @@ while true; do
     V6_OK=0
     V4_OK=0
     ping -6 -c 1 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && V6_OK=1
-    ping -4 -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && V4_OK=1
+    ping -4 -I 464-clat -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && V4_OK=1
 
     if [ "$V6_OK" -eq 1 ] && [ "$V4_OK" -eq 1 ]; then
         STATE="dual"
